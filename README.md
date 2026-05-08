@@ -1,0 +1,72 @@
+# BS 塞尔达传说 广播推送终端 (BS-Zelda-Satellaview-Terminal)
+
+本项目是一个为 **汉化版 BS 塞尔达传说 (BS Zelda no Densetsu)** 设计的第三方辅助工具。它旨在模拟 1995 年原版 Satellaview 的实时同步广播音频流。并且通过 Python 与 Mesen 模拟器联动，还原当年的剧情播放与成绩结算系统。（这部分代码保存在BS套件的PSRAM中，近乎永久性物理丢失，已无处获得，网络上流出的ROM均不包含此部分。）
+
+## 🛠️ 核心功能
+* **虚拟卫星推送**：模拟 18:00 广播开始后，自动触发数据下发。
+* **视频遮罩投影**：在模拟器窗口上方自动叠加剧情视频与等待画面。
+* **音频同步管理**：支持播放外部 `.wav` 广播音频，并具备检测加农战触发后的静音逻辑。
+* **实时数据监视**：通过 Lua 脚本实时读取模拟器内存，监控玩家的损失总血量、死亡次数及三角力量收集进度。
+* **美化结算 UI**：在游戏结束后，自动弹出成绩单遮罩，展示本周的详细战绩。
+
+## 💻 运行要求
+* **操作系统**：Windows 10 及以上测试通过
+* **必要软件**：
+    * Python 3.9.13 或更高版本。
+    * [Mesen 模拟器](https://www.mesen.ca/)。
+    * 汉化资源包下载：暂空
+
+## 🚀 快速开始
+1. **安装依赖库**：
+   在项目根目录打开终端运行：
+   ```bash
+   pip install -r requirements.txt
+   
+### ⚙️ 配置与启动
+
+1. **配置模拟器**：
+   * 下载mesen 2.1.1。
+   * 双击打开并进行安装配置，选择 Store the data in same folder as the application，能更容易定位模拟器目录。
+   * 下载配套使用的汉化资源包，解压，将 `bszelda` 文件夹放置在刚刚安装好的 mesen 模拟器的根目录中。
+   * 打开模拟器的设置菜单，选择 Settings - SNES - BS-X，选择 Use custom date and time，并将时间设置为 9：59。
+   * 打开模拟器的Debug菜单，选择 Script Window - Script - Settings，开启 Allow access to I/O and OS functions。
+
+3. **启动程序**：
+   * 运行 `main.py`。
+   * 在界面中点击按钮选择你的 `Mesen.exe` 主程序。
+   * 选择对应周任务后点击启动即可。
+
+---
+
+### 📂 项目结构说明
+
+* **`main.py`**：基于 Tkinter 和 OpenCV 构建的主逻辑程序，负责 UI 和视频渲染。
+* **`bs.lua`**：负责内存读取与信号下发的 Lua 核心脚本，需在模拟器内运行。
+* **`ui/`**：存放结算界面背景 `bg_result.png` 和三角力量动画 `triforce_on.gif`。
+* **`requirements.txt`**：记录项目所需的 `pygame`, `opencv-python`, `pygetwindow` 等核心依赖。
+
+---
+
+### ❓ 常见问题 (FAQ)
+
+* **发现某些广播进度不同步**
+  * 在开始播放剧情动画时，请勿操作模拟器的手柄按键。
+  * 查看模拟器的 BS-X 时钟设置，选择 Use custom date and time，并将时间设置为 9：59，切记在选择后点击√才会生效。
+
+    
+* **无法与外部程序通信**
+  * 请确认 Mesen 已经成功加载并运行了 `bs.lua` 脚本。
+  * 检查模拟器目录下的 `LuaScriptData/bs` 文件夹是否具有写入权限。
+  * 检查是否在模拟器内已开启 Allow access to I/O and OS functions。
+  * 查看BS-X时钟设置，选择 Use custom date and time，并将时间设置为 9：59。
+    
+* **UI部分显示不全或错乱**
+  * 由于缺少4K显示器进行测试，故无法完善此部分，建议将 Windows 缩放比例调整为 150% 即可解决。
+
+---
+
+### ⚖️ 许可证
+
+本项目采用 **MIT License** 开源。你可以自由地使用、修改和分发代码，但请务必保留原作者信息。
+
+> **注**：本工具仅供技术交流与怀旧体验，项目本身**不包含**游戏 ROM、视频或音频等受版权保护的内容。
