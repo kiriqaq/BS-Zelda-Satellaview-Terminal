@@ -29,10 +29,8 @@
 
 1. **配置模拟器**：
    * 下载mesen 2.1.1。
-   * 双击打开并进行安装配置，选择 Store the data in same folder as the application，能更容易定位模拟器目录。
-   * 下载配套使用的汉化资源包，解压，将 `bszelda` 文件夹放置在刚刚安装好的 mesen 模拟器的根目录中。
-   * 打开模拟器的设置菜单，选择 Settings - SNES - BS-X，选择 Use custom date and time，并将时间设置为 9：59。
-   * 打开模拟器的Debug菜单，选择 Script Window - Script - Settings，开启 Allow access to I/O and OS functions。
+   * 双击打开并进行安装配置，必须选择 Store the data in same folder as the application。
+   * 下载配套使用的汉化资源包，解压，将 `bszelda` 和 `Satellaview` 文件夹放置在 mesen 模拟器的根目录中覆盖。
 
 3. **启动程序**：
    * 运行 `main.py`。
