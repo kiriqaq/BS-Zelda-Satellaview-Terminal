@@ -1,8 +1,8 @@
-﻿-- ===================================
--- Satellaview (BS-X) 综合同步监控脚本
--- 开发版本：2026.05.20 Final fix
--- 作者：AcFun 游戏咖啡馆
--- ===================================
+﻿-- ============================================
+-- Satellaview (BS-X) 综合同步监控
+-- 开发版本：2026.05.22 fix lock
+-- 作者：AcFun 游戏咖啡馆 & AI Collaborator
+-- ============================================
 
 -- 缓存常用全局函数，提升每帧执行效率
 local read       = emu.read
@@ -22,7 +22,6 @@ local ADDR_SETTLE_STATE  = 0x7FFFFF     -- 结算状态触发位 (游戏时间57
 local ADDR_PLOT_STATE    = 0x7E2000     -- 剧情逻辑开关：0x0B 代表加农在出现，触发 SoundLink 静音
 
 -- [游戏数值统计 - SRAM 偏移]
--- SaveRAM 区域，记录玩家成绩
 local ADDR_DEATHS        = 0x263A       -- 死亡次数累计
 local ADDR_HEART         = 0x2636       -- 角色损失的心数量 (原始值需除以2)
 local ADDR_RUPEE         = 0x201F       -- 卢比地址
@@ -30,9 +29,8 @@ local ADDR_TRIFORCE      = 0x2022       -- 三角力碎片收集状态 (按位�
 local ADDR_GANON_DEFEAT  = 0x263C       -- 加农击破标志
 
 -- [同步参数]
--- 因PSRAM丢失，使用模拟按键执行游戏本体
-local TARGET_FRAME       = 24640         -- 理想跳转帧 (对应真实时间线)
-local LATE_DELAY         = 120           -- 迟到玩家直接跳转
+local TARGET_FRAME       = 24600        -- 理想跳转帧 (对应真实时间线)
+local LATE_DELAY         = 120          -- 迟到玩家直接跳转
 
 -- [外部同步文件]
 local SIGNAL_FILE        = "chapter_signal.txt"  -- 章节和性别切换信号
@@ -42,19 +40,19 @@ local TRIGGER_FILE       = "settle_trigger.txt"  -- 结算信号
 local GANON_SPAWN_FILE   = "ganon_spawn.txt"     -- 触发加农战信号
 
 -- ====== 2. 运行时状态变量 ======
-local LAST_SIGNAL        = "FF"
 local HAS_LOADED         = false
 local LOAD_TIME_FRAME    = 0            -- 记录玩家下载完成帧
 local HAS_TRIGGERED_SETTLE = false
 local HAS_PRESSED_A      = false        -- 入场 A 键同步拦截位
 local HAS_GANON_SPAWNED  = false        -- 加农出现状态拦截位
+local is_input_disabled  = false        -- 默认放行按键
 
 local LAST_DEATHS, LAST_HEARTS, LAST_RUPEES, LAST_TRIFORCE, LAST_GANON = -1, -1, -1, -1, -1
 local frameCounter       = 0
 local checkInterval      = 4            -- 每 4 帧检查一次
+local load_callback_handle = nil        -- 防重复注册的硬件回调句柄
 
 -- ====== 3. 基础文件操作 ======
--- 必须开启 Allow access to I/O and OS functions
 local cachedDataFolder = nil
 local function writeToFile(filename, content)
     if not cachedDataFolder then
@@ -72,18 +70,36 @@ local function writeToFile(filename, content)
     end
 end
 
--- ====== 4. 硬件加载 Hook ======
--- 当 Mesen 加载 ROM 完成时触发，模拟卫星信号就绪
+-- ====== 4. 核心事件回调注册 ======
+
+-- 手柄轮询级输入拦截，用于看剧情等待时间
+-- 一旦处于前置锁死状态（is_input_disabled == true），玩家手柄将完全失灵
+emu.addEventCallback(function()
+    if is_input_disabled then
+        local block_input = {
+            a = false, b = false, x = false, y = false, 
+            up = false, down = false, left = false, right = false, 
+            select = false, start = false, l = false, r = false
+        }
+        setInput(block_input, 0)
+    end
+end, emu.eventType.inputPolled)
+
+
+-- 硬件加载 Hook：当检测到 ROM 挂载完成时触发
 local function onHardwareLoadWrite(address, value)
     if not HAS_LOADED then
         writeToFile(LOAD_FILE, "1")
         HAS_LOADED = true
         LOAD_TIME_FRAME = getState().frameCount
-        log(string.format("Memory Pack 已挂载。记录入场帧: %d", LOAD_TIME_FRAME))
+        
+        -- 锁死玩家的手柄输入
+        is_input_disabled = true
+        log(string.format("Memory Pack 已挂载。记录入场帧: %d。进入前置锁死状态，禁止玩家操作！", LOAD_TIME_FRAME))
     end
 end
 
--- ====== 5. 核心监控逻辑 ======
+-- ====== 5. 核心数据与时序监控逻辑 ======
 function monitorEverything()
     frameCounter = frameCounter + 1
     if frameCounter < checkInterval then return end
@@ -92,8 +108,7 @@ function monitorEverything()
     local state = getState()
     local currentFrame = state.frameCount
 
-    -- 加农剧情监测
-    -- 监测加农是否生成，用于外部广播静音切换
+    -- 1. 加农剧情监测
     local plotState = read(ADDR_PLOT_STATE, snesMem, false)
     if plotState == 0x0B then
         if not HAS_GANON_SPAWNED then
@@ -102,7 +117,6 @@ function monitorEverything()
             log("检测到状态 0B：加农已出现")
         end
     else
-        -- 状态重置逻辑：当离开加农房或剧情结束时，恢复拦截位
         if HAS_GANON_SPAWNED and plotState ~= 0x0B then
             HAS_GANON_SPAWNED = false
             writeToFile(GANON_SPAWN_FILE, "0")
@@ -110,31 +124,31 @@ function monitorEverything()
         end
     end
 
-    -- 自动 A 键同步
-    -- 模拟丢失的PSRAM跳转功能
+    -- 2. 自动 A 键同步
     if HAS_LOADED and not HAS_PRESSED_A then
         local shouldPress = false
         if LOAD_TIME_FRAME < TARGET_FRAME then
-            -- 准时/早到玩家：等到 TARGET_FRAME 准时切入
             if currentFrame >= TARGET_FRAME then shouldPress = true end
         else
-            -- 迟到玩家：在进场后延迟 LATE_DELAY 帧强制切入
             if currentFrame >= (LOAD_TIME_FRAME + LATE_DELAY) then shouldPress = true end
         end
 
         if shouldPress then
-            setInput({ a = true })
+            -- 到了自动按 A 键切入游戏的瞬间，立刻解除操作拦截锁
+            is_input_disabled = false
+            
+            -- 下发核心入场 A 键指令，由于上一行锁已解，这一发 A 键将拥有最高时序优先级，直接送入游戏
+            setInput({ a = true }, 0)
             HAS_PRESSED_A = true
-            log(string.format("触发入场 A 键。当前帧: %d, 基准帧: %d", currentFrame, TARGET_FRAME))
+            log(string.format("触发入场 A 键，操作锁定安全解除！玩家恢复自由控制  当前帧: %d", currentFrame))
         end
     end
 
-    -- 章节信号与性别监测
-    -- 自动识别当前播放的是第几周(1-4)以及角色性别
+    -- 3. 章节信号与性别监测
     local rawSignal = read(ADDR_SIGNAL, bsxMem, false)
     if rawSignal and rawSignal >= 0 and rawSignal <= 3 then
         local genderVal = read(ADDR_GENDER, snesMem, false)
-        local genderSuffix = (genderVal == 1) and "g" or "b" -- g: Girl, b: Boy
+        local genderSuffix = (genderVal == 1) and "g" or "b"
         local currentCombined = (rawSignal + 1) .. genderSuffix
 
         if currentCombined ~= LAST_SIGNAL then
@@ -144,8 +158,7 @@ function monitorEverything()
         end
     end
 
-    -- 结算触发检测
-    -- 监测游戏是否进入最终结算
+    -- 4. 结算触发检测
     local settleState = read(ADDR_SETTLE_STATE, snesMem, false)
     if settleState == 0x39 then
         if not HAS_TRIGGERED_SETTLE then
@@ -157,23 +170,20 @@ function monitorEverything()
         HAS_TRIGGERED_SETTLE = false
     end
 
-    -- 结算数据统计
-    -- 抓取玩家战绩数据并序列化，供外部程序渲染使用
+    -- 5. 结算数据统计
     local rawDeaths   = emu.readWord(ADDR_DEATHS, sramMem, false) or 0
     local rawHeartVal = emu.readWord(ADDR_HEART, sramMem, false) or 0
-    -- 取整计算损失生命数量
     local heartLoss   = math.floor(rawHeartVal / 2)
     local totalRupees = emu.readWord(ADDR_RUPEE, sramMem, false) or 0
     local triforce    = read(ADDR_TRIFORCE, sramMem, false) or 0
     local ganonDefeat = read(ADDR_GANON_DEFEAT, sramMem, false) or 0
 
-    -- 仅当数据发生变化时才写入文件
     if rawDeaths ~= LAST_DEATHS or heartLoss ~= LAST_HEARTS or 
        totalRupees ~= LAST_RUPEES or triforce ~= LAST_TRIFORCE or 
        ganonDefeat ~= LAST_GANON then
         
         local resultData = string.format("DEATH:%d|HEART_LOSS:%d|RUPEE:%d|TRIFORCE:%02X|GANON:%d", 
-                                          rawDeaths, heartLoss, totalRupees, triforce, ganonDefeat)
+                                         rawDeaths, heartLoss, totalRupees, triforce, ganonDefeat)
         writeToFile(RESULT_FILE, resultData)
         LAST_DEATHS, LAST_HEARTS, LAST_RUPEES, LAST_TRIFORCE, LAST_GANON = 
             rawDeaths, heartLoss, totalRupees, triforce, ganonDefeat
@@ -183,7 +193,6 @@ end
 
 -- ====== 6. 系统初始化与重置 ======
 local function resetSystem()
-    -- 恢复所有拦截位至初始状态
     HAS_LOADED = false
     LOAD_TIME_FRAME = 0
     HAS_TRIGGERED_SETTLE = false
@@ -192,23 +201,24 @@ local function resetSystem()
     LAST_SIGNAL = "FF"
     LAST_DEATHS, LAST_HEARTS, LAST_RUPEES, LAST_TRIFORCE, LAST_GANON = -1, -1, -1, -1, -1
     
-    -- 初始化同步文件，防止旧数据干扰外部程序
+    -- 输入锁定开关初始化重置
+    is_input_disabled = false
+    
     writeToFile(SIGNAL_FILE, "FF")
     writeToFile(LOAD_FILE, "0")
     writeToFile(TRIGGER_FILE, "IDLE") 
     writeToFile(GANON_SPAWN_FILE, "0")
     
-    -- 注册硬件挂载回调
-    emu.addMemoryCallback(onHardwareLoadWrite, emu.callbackType.write, ADDR_LOAD_DONE, ADDR_LOAD_DONE, emu.cpuType.snes, bsxMem)
+    if not load_callback_handle then
+        load_callback_handle = emu.addMemoryCallback(onHardwareLoadWrite, emu.callbackType.write, ADDR_LOAD_DONE, ADDR_LOAD_DONE, emu.cpuType.snes, bsxMem)
+    end
     
     log("==========================================")
-    log("  BS Zelda 同步脚本已重置：[核心监控已就绪]  ")
+    log("  BS Zelda 同步脚本已重置：[综合监控已就绪]  ")
     log("==========================================")
 end
 
--- 注册框架事件回调
 emu.addEventCallback(monitorEverything, emu.eventType.frameEnd)
 emu.addEventCallback(resetSystem, emu.eventType.reset)
 
--- 脚本启动
 resetSystem()
