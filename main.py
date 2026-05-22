@@ -1,22 +1,66 @@
 # -*- coding: utf-8 -*-
-import subprocess
-import time
-import os
-import threading
-import logging
-import shutil
 import ctypes
-import re
 import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
 from ctypes import windll, wintypes
 from datetime import datetime, timedelta
 from tkinter import (Tk, Label, filedialog, StringVar, Button, Frame, Toplevel, Canvas, messagebox, TclError)
+
 import pygame
-import cv2
 import pygetwindow as gw
 from PIL import Image, ImageTk
 
-# --- 全局常量配置 ---
+# 强行注入 MPV DLL 绝对路径
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_INTERNAL_DIR = os.path.join(_CURRENT_DIR, "_internal")
+
+# 将 根目录 和 _internal 目录全部灌入 Windows 的 DLL 搜索网络
+if hasattr(os, "add_dll_directory"):
+    for dll_path in [_CURRENT_DIR, _INTERNAL_DIR]:
+        if os.path.exists(dll_path):
+            try:
+                os.add_dll_directory(dll_path)
+            except OSError:
+                pass
+
+# 同时确保环境变量 PATH 把这两个地方全部覆盖，防止老系统加载失败
+os.environ["PATH"] = (
+    _CURRENT_DIR + os.pathsep +
+    _INTERNAL_DIR + os.pathsep +
+    os.environ.get("PATH", "")
+)
+
+# 引入 MPV 核心库
+try:
+    import mpv
+except ImportError:
+    logging.error("未检测到 python-mpv 库，请执行: pip install python-mpv")
+    raise
+
+# 核心依赖库加载与初始化
+try:
+    from pycaw.pycaw import AudioUtilities
+except ImportError:
+    logging.error("未检测到 pycaw 库，请执行: pip install pycaw")
+    AudioUtilities = None
+
+try:
+    windll.shcore.SetProcessDpiAwareness(1)
+except (AttributeError, OSError):
+    pass
+
+try:
+    pygame.mixer.init()
+except pygame.error as pg_err:
+    logging.error(f"无法初始化音频设备: {pg_err}")
+
+# 全局常量配置
 TARGET_WINDOW_TITLE = 'Mesen - bs'  # 目标模拟器窗口的标题关键字
 SIGNAL_CHECK_INTERVAL = 0.2  # 轮询 Lua 信号文件的时间间隔（秒）
 RETRY_DELAY = 0.05  # 文件读取冲突时的重试延迟
@@ -24,28 +68,14 @@ UI_FONT_BOLD = ("Verdana", 18, "bold")  # 标准粗体 UI 字体
 MONITOR_FONT = ("Verdana", 14, "bold")  # 数据监视区字体
 TRIFORCE_FONT = ("Verdana", 16, "bold")  # 三角力量专用字体
 
-# --- 核心依赖库加载与初始化 ---
-try:
-    # pycaw 用于控制 Windows 系统的应用程序音量（实现模拟器自动静音）
-    from pycaw.pycaw import AudioUtilities
-except ImportError:
-    logging.error("未检测到 pycaw 库，请执行: pip install pycaw")
-    AudioUtilities = None
-
-try:
-    # 启用进程级 DPI 感知，防止在 Windows 高分屏缩放设置下界面模糊
-    windll.shcore.SetProcessDpiAwareness(1)
-except (AttributeError, OSError):
-    pass
-
-try:
-    # 初始化 Pygame 音频混音器，用于播放广播音频（wav）
-    pygame.mixer.init()
-except pygame.error as pg_err:
-    logging.error(f"无法初始化音频设备: {pg_err}")
-
-# 配置全局日志格式：显示时间、级别和具体信息
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()  # 仅保留标准控制台输出
+    ]
+)
 
 
 class BSXSimulator:
@@ -56,48 +86,50 @@ class BSXSimulator:
 
     def __init__(self):
         # 1. 初始化系统环境
-        self.dpi_scale = self._get_system_dpi_scale()  # 获取当前系统缩放倍率
-        self.show_debug_ui = False  # 是否显示底部的数据监视面板
+        self.dpi_scale = self._get_system_dpi_scale()
+        self.show_debug_ui = False
 
         self.root = Tk()
         self.root.title("BS 塞尔达传说 广播终端")
 
-        # 根据 DPI 缩放动态计算窗口尺寸
         window_w = int(400 * self.dpi_scale)
         window_h = int((870 if self.show_debug_ui else 470) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
-        # 2. 初始化路径变量（通过选择 Mesen.exe 动态确定）
-        self.mesen_path = ""  # Mesen 主程序路径
-        self.mesen_dir = ""  # Mesen 所在目录
-        self.lua_data_dir = ""  # Lua 脚本交互文件的存放目录
-        self.bs_sfc_path = ""  # BS-X BIOS 存放路径
+        # 2. 初始化路径变量
+        self.mesen_path = ""
+        self.mesen_dir = ""
+        self.lua_data_dir = ""
+        self.bs_sfc_path = ""
 
         # 3. 初始化状态控制变量
-        self.selected_chapter = None  # 当前选中的周目 (1-4)
-        self.timer_running = False  # 虚拟时钟是否正在运行
-        self.has_triggered_1800 = False  # 是否已触发 18:00 的广播逻辑
-        self._target_window = None  # 缓存捕获到的模拟器窗口对象
+        self.selected_chapter = None
+        self.timer_running = False
+        self.has_triggered_1800 = False
+        self._target_window = None
+        self._anim_timers = []
+        self._mesen_audio_session = None
+        self._audio_lock = threading.Lock()
+        self._mpv_destroying = False
 
         # 4. 视频遮罩与 UI 引用容器
-        self.overlay = None  # 悬浮在模拟器上方的 TopLevel 窗口
-        self.canvas = None  # 遮罩上的画布
-        self.cap = None  # OpenCV 视频流对象
-        self.image_ptr = None  # 画布上的图片对象 ID
-        self.tk_image_cache = None  # 视频帧缓存
-        self.bg_image_ref = None  # 结算背景图缓存
-        self.triforce_frames = []  # 三角力量 GIF 动画帧序列
-        self.ui_refs = []  # 其他 UI 静态资源引用
+        self.overlay = None
+        self.canvas = None
+        self.video_frame = None
+        self.mpv_player = None
+        self.bg_image_ref = None
+        self.triforce_frames = []
+        self.ui_refs = []
 
         # 5. 播放状态标志
-        self.settlement_active = False  # 是否正在显示结算界面
-        self.is_ending_mode = False  # 是否处于最终结局视频播放状态
-        self.is_waiting_video_mode = False  # 是否处于“等待广播开始”的循环视频状态
-        self.is_ganon_room_active = False  # 是否处于加农房间（需静音广播）
-        self.ganon_mute_timer = None  # 离开加农房后的延迟恢复定时器
-        self.settlement_audio_locked = False  # 结算音频是否已锁定（防止被其他逻辑干扰音量）
-        self._last_geo = ""  # 记录上次遮罩的位置，用于判断是否需要重绘
+        self.settlement_active = False
+        self.is_ending_mode = False
+        self.is_waiting_video_mode = False
+        self.is_ganon_room_active = False
+        self.ganon_mute_timer = None
+        self.settlement_audio_locked = False
+        self._last_geo = ""
 
         # 6. 绑定 UI 数据变量
         self.time_var = StringVar(value="17:59:00")
@@ -110,12 +142,15 @@ class BSXSimulator:
 
         self._setup_ui()
 
+        # 注册跨线程绝对安全的事件监听
+        self.root.bind("<<VideoEndRouting>>", lambda e: self._safe_trigger_video_routing())
+        self.root.bind("<<EndingClose>>", lambda e: self._safe_trigger_ending_close())
+
     @staticmethod
     def _get_system_dpi_scale():
-        """ 通过 WinAPI 获取当前系统的屏幕缩放比例 (如 125% -> 1.25) """
         try:
             hdc = windll.user32.GetDC(0)
-            dpi = windll.gdi32.GetDeviceCaps(hdc, 88)  # 88 代表 LOGPIXELSX
+            dpi = windll.gdi32.DeviceCaps(hdc, 88)
             windll.user32.ReleaseDC(0, hdc)
             return dpi / 96.0
         except (AttributeError, OSError):
@@ -123,7 +158,6 @@ class BSXSimulator:
 
     @staticmethod
     def _load_gif_frames(path, size):
-        """ 加载 GIF 动画的所有帧并缩放到指定尺寸，用于三角力量旋转效果 """
         frames = []
         try:
             img = Image.open(path)
@@ -136,58 +170,85 @@ class BSXSimulator:
             logging.error(f"加载 GIF 帧失败 ({os.path.basename(path)}): {img_err}")
             return []
 
-    @staticmethod
-    def _set_mesen_mute(mute=True):
-        """ 利用 pycaw 精确控制 Mesen.exe 的系统混音器开关，实现“广播替代游戏 BGM” """
+    def _set_mesen_mute(self, mute=True):
         if AudioUtilities is None:
             logging.warning("[音频同步] 由于未安装 pycaw 库，无法控制模拟器静音")
             return False
-        try:
-            sessions = AudioUtilities.GetAllSessions()
-            for session in sessions:
-                if session.Process and session.Process.name().lower() == "mesen.exe":
-                    volume = session.SimpleAudioVolume
-                    volume.SetMute(1 if mute else 0, None)
-                    logging.info(f"[音频同步] Mesen 模拟器已{'静音' if mute else '恢复音量'}")
-                    return True
-        except Exception as e:
-            logging.error(f"音量控制失败: {e}")
-        return False
+
+        with self._audio_lock:  # 强行加锁，保证同一时间只有一个线程能操作 pycaw
+            # 1. 检查缓存，同时必须验证这个进程是不是还在正常运行
+            if self._mesen_audio_session:
+                try:
+                    # 通过直接获取常驻进程状态探活
+                    if self._mesen_audio_session.Process and self._mesen_audio_session.Process.status == "running":
+                        self._mesen_audio_session.SetMute(1 if mute else 0, None)
+                        logging.info(f"[音频同步] 通过安全缓存控制 Mesen 模拟器{'静音' if mute else '恢复音量'}")
+                        return True
+                    else:
+                        raise ValueError("Mesen process is no longer running")
+                except(ValueError, AttributeError, OSError):
+                    logging.warning("[音频同步] 缓存的 Mesen 音频句柄已失效或进程已变动，尝试重新获取...")
+                    self._mesen_audio_session = None
+
+            # 2. 重新捕获
+            try:
+                sessions = AudioUtilities.GetAllSessions()
+                for session in sessions:
+                    if session.Process and session.Process.name().lower() == "mesen.exe":
+                        self._mesen_audio_session = session.SimpleAudioVolume
+                        self._mesen_audio_session.SetMute(1 if mute else 0, None)
+                        logging.info(f"[音频同步] 成功捕获并重新缓存 Mesen 音频句柄")
+                        return True
+            except Exception as e:
+                logging.error(f"音量控制或捕获失败: {e}")
+            return False
 
     def _patch_mesen_settings(self):
-        """ 修改 Mesen 根目录下的 settings.json 配置文件 """
         settings_path = os.path.join(self.mesen_dir, "settings.json")
         if not os.path.exists(settings_path):
             logging.warning(f"[配置] 未找到配置文件: {settings_path}")
             return
 
         try:
-            # 读取原有配置
             with open(settings_path, 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
 
-            # 添加访问文件权限
+            # 1. 开启 Lua 脚本系统 IO/OS 访问权限
             if "Debug" in config and "ScriptWindow" in config["Debug"]:
                 config["Debug"]["ScriptWindow"]["AllowIoOsAccess"] = True
                 logging.info("[配置] 成功开启脚本 IO/OS 访问权限")
 
-            # 修改 BS-X 时间设置
+            # 2. 修改 BSX 卫星时钟底座时间
             if "Snes" in config:
                 config["Snes"]["BsxUseCustomTime"] = True
                 config["Snes"]["BsxCustomTime"] = "09:59:00"
                 logging.info("[配置] 成功修改 Bsx 时间")
 
-            # 写回配置
+            # 3. 清除手柄快进/快退快捷键绑定
+            if "Preferences" in config and "ShortcutKeys" in config["Preferences"]:
+                shortcut_keys_list = config["Preferences"]["ShortcutKeys"]
+                if isinstance(shortcut_keys_list, list):
+                    modified_shortcuts = 0
+                    for shortcut_item in shortcut_keys_list:
+                        # 匹配快进或快退项
+                        if shortcut_item.get("Shortcut") in ["FastForward", "Rewind"]:
+                            if "KeyCombination2" in shortcut_item:
+                                shortcut_item["KeyCombination2"]["Key1"] = 0
+                                modified_shortcuts += 1
+
+                    if modified_shortcuts > 0:
+                        logging.info(
+                            f"[配置] 成功清除手柄快进/快退按键绑定 (共修改 {modified_shortcuts} 项)")
+
+            # 保存修改后的完整 JSON 配置
             with open(settings_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
 
-            logging.info("[配置] settings.json 已成功修改")
+            logging.info("[配置] settings.json 已成功修改并安全保存")
         except Exception as e:
             logging.error(f"[配置] 自动修改 settings.json 失败: {e}")
 
     def _fade_volume(self, target_volume, duration=0.8):
-        """ 广播音频的音量渐变（淡入/淡出），提升转场自然度 """
-
         def fade():
             try:
                 start_volume = pygame.mixer.music.get_volume()
@@ -195,7 +256,7 @@ class BSXSimulator:
                 interval = duration / steps
                 delta = (target_volume - start_volume) / steps
                 for i in range(steps):
-                    if self.settlement_audio_locked:  # 结算期间不进行渐变干扰
+                    if self.settlement_audio_locked:
                         return
                     new_vol = start_volume + delta * (i + 1)
                     pygame.mixer.music.set_volume(max(0.0, min(1.0, new_vol)))
@@ -205,41 +266,35 @@ class BSXSimulator:
             except Exception as e:
                 logging.error(f"音量渐变执行失败: {e}")
 
-        threading.Thread(target=fade, daemon=True).start()
+        threading.Thread(target=fade, daemon=True, name="AudioFadeThread").start()
 
     def _get_client_geometry(self, hwnd):
-        """ 获取模拟器渲染区域（Client Area）的绝对坐标和尺寸，避开标题栏和边框 """
         rect = wintypes.RECT()
         windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
         w = rect.right - rect.left
         h = rect.bottom - rect.top
         point = wintypes.POINT(0, 0)
         windll.user32.ClientToScreen(hwnd, ctypes.byref(point))
-        # 针对 Mesen 渲染布局的微调偏移量
         offset = int(25 * self.dpi_scale)
         return w, h - offset, point.x, point.y + offset
 
     def _setup_ui(self):
-        """ 构建 Tkinter 主界面布局 """
         dynamic_ui_font = ("Verdana", int(18 * self.dpi_scale), "bold")
         dynamic_monitor_font = ("Verdana", int(14 * self.dpi_scale), "bold")
         dynamic_tf_font = ("Verdana", int(16 * self.dpi_scale), "bold")
 
-        # 1. 虚拟时钟显示区
         time_frame = Frame(self.root, pady=20)
         time_frame.pack()
         Label(time_frame, text="虚拟卫星时钟", font=dynamic_ui_font).pack(side="left")
         self.time_display = Label(time_frame, textvariable=self.time_var, font=dynamic_ui_font, fg="#e74c3c", padx=10)
         self.time_display.pack(side="left")
 
-        # 2. 状态提示与引导按钮
         self.status_label = Label(self.root, textvariable=self.status_var, fg="#2c3e50",
                                   wraplength=int(350 * self.dpi_scale), height=3, justify="center")
         self.status_label.pack(pady=5)
         self.btn_select = Button(self.root, text="第一步：选择 Mesen.exe", command=self.select_mesen, width=30, height=2)
         self.btn_select.pack(pady=10)
 
-        # 3. 周目选择区
         self.ch_frame = Frame(self.root, pady=5)
         self.ch_frame.pack()
         self.chapter_buttons = []
@@ -252,12 +307,11 @@ class BSXSimulator:
         self.btn_stop = Button(self.root, text="重置状态", command=self.reset_system, width=30, state="disabled")
         self.btn_stop.pack(pady=15)
 
-        # 4. 创建删除存档按钮，初始为禁用状态(disabled)
-        self.btn_delete_save = Button(self.root, text="删除存档（模拟器关闭状态下使用）", command=self.delete_bios_save, width=30,
+        self.btn_delete_save = Button(self.root, text="删除存档（模拟器关闭状态下使用）", command=self.delete_bios_save,
+                                      width=30,
                                       state="disabled", fg="#c0392b")
         self.btn_delete_save.pack(pady=5)
 
-        # 5. 调试/监视面板（仅在 self.show_debug_ui 为 True 时可见）
         if self.show_debug_ui:
             monitor_section = Frame(self.root, pady=10, padx=20, relief="groove", borderwidth=2)
             monitor_section.pack(fill="x", padx=20, pady=10)
@@ -275,14 +329,11 @@ class BSXSimulator:
             self.btn_test.pack(pady=5, fill="x")
 
     def select_mesen(self):
-        """ 处理用户选择模拟器的行为，并初始化相关路径 """
         path = filedialog.askopenfilename(title="选择 Mesen.exe", filetypes=[("Mesen", "Mesen.exe")])
         if path:
             self.mesen_path = path
             self.mesen_dir = os.path.dirname(path)
-            # 修改bs-x相关模拟器配置 ---
             self._patch_mesen_settings()
-            # 约定：Lua 数据交换文件必须放在 Mesen/LuaScriptData/bs 目录下
             self.lua_data_dir = os.path.join(self.mesen_dir, "LuaScriptData", "bs")
             self.bs_sfc_path = os.path.join(self.mesen_dir, "bszelda", "bs.sfc")
             self.btn_delete_save.config(state="normal")
@@ -292,18 +343,11 @@ class BSXSimulator:
                 self._activate_chapter_selection()
 
     def delete_bios_save(self):
-        """ 点击后删除 mesen 文件夹下 saves/BsxBios.srm 文件 """
         if not self.mesen_dir:
             return
-
-        # 1. 拼接目标存档的绝对路径
         save_file_path = os.path.join(self.mesen_dir, "saves", "BsxBios.srm")
-
-        # 2. 弹出二次确认提示框
         confirm = messagebox.askyesno("删除存档确认",
                                       "确定要删除 BS-X BIOS 存档（BsxBios.srm）吗？\n此操作将清除游戏内注册的角色和所有广播游戏的进度。")
-
-        # 3. 如果用户点击了“是”
         if confirm:
             if os.path.exists(save_file_path):
                 try:
@@ -313,11 +357,9 @@ class BSXSimulator:
                 except Exception as e:
                     messagebox.showerror("错误", f"无法删除存档文件: {e}")
             else:
-                # 处理文件还未生成的边缘情况
-                messagebox.showinfo("提示", "未找到存档文件，无需删除。\n(可能你还没有在模拟器中进入过游戏或创建过角色)")
+                messagebox.showinfo("提示", "未找到存档文件，无需删除。")
 
     def _handle_missing_bios(self):
-        """ 引导用户配置 BS-X BIOS 核心文件 """
         messagebox.showinfo("核心文件检查", "未检测到 BS-X BIOS，请手动选择。")
         bios_file = filedialog.askopenfilename(
             title="请选择 BS-X BIOS",
@@ -334,31 +376,34 @@ class BSXSimulator:
             self.status_var.set("配置未完成。")
 
     def _activate_chapter_selection(self):
-        """ 开启周任务选择阶段 """
         self.status_var.set("系统就绪：请选择第几周的任务。")
         self.btn_select.config(text="第二步：请选择第几周...", state="disabled")
         for btn in self.chapter_buttons:
             btn.config(state="normal")
 
     def prepare_chapter(self, ch):
-        """ 锁定选中的周 """
         self.selected_chapter = ch
         self.status_var.set(f"已锁定：第 {ch} 周\n倒计时准备就绪。")
         self.btn_select.config(text="第三步：点击后1分钟进行广播推送", command=self.start_countdown, state="normal")
 
     def reset_system(self):
-        """ 全局重置：停止时钟、关闭视频、停止音频、恢复模拟器声音 """
+        logging.info("[系统指令] 用户点击了重置系统按钮...")
         self.timer_running = False
         self._target_window = None
         self.settlement_audio_locked = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
         self.close_overlay()
-        if pygame.mixer.get_init():
-            pygame.mixer.music.set_volume(1.0)
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.set_volume(1.0)
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        except Exception as pg_reset_err:
+            logging.warning(f"[音频重建] 重置系统时发现音频设备故障，正在尝试热重载音频层: {pg_reset_err}")
+            try:
+                pygame.mixer.quit()
+                pygame.mixer.init()
+            except pygame.error:
+                pass
         if self.ganon_mute_timer:
             try:
                 self.root.after_cancel(self.ganon_mute_timer)
@@ -372,9 +417,9 @@ class BSXSimulator:
         self.is_ending_mode = False
         self.btn_stop.config(state="disabled")
         self._activate_chapter_selection()
+        logging.info("[系统指令] 系统复位完毕。")
 
     def read_lua_file(self, filename, retries=2):
-        """ 安全读取 Lua 脚本生成的数据文件，带简单的冲突重试机制 """
         if not self.lua_data_dir:
             return None
         path = os.path.join(self.lua_data_dir, filename)
@@ -386,8 +431,22 @@ class BSXSimulator:
                 time.sleep(RETRY_DELAY)
         return None
 
+    def write_lua_file(self, filename, content, retries=3):
+        """带有冲突重试机制的安全 Lua 文件写入"""
+        if not self.lua_data_dir:
+            return False
+        path = os.path.join(self.lua_data_dir, filename)
+        for _ in range(retries):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                return True
+            except (PermissionError, OSError):
+                time.sleep(RETRY_DELAY)
+        logging.error(f"[信号写入] 尝试重写 {filename} 失败，文件可能被系统或模拟器独占")
+        return False
+
     def update_settlement_display(self):
-        """ 解析 result_data.txt，将游戏内存提取的成绩转换为 UI 可读数据 """
         content = self.read_lua_file("result_data.txt")
         if content:
             try:
@@ -395,14 +454,13 @@ class BSXSimulator:
                     parts = item.split(":", 1)
                     return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else ("UNKNOWN", "0")
 
-                # 数据格式示例：DEATH:0|HEART_LOSS:5|TRIFORCE:FF
                 data = dict(parse_kv(item) for item in content.split("|") if ":" in item)
                 self.death_var.set(f"重新开始的次数: {data.get('DEATH', '0')} 次")
                 self.heart_var.set(f"损失的心心数量: {data.get('HEART_LOSS', '0')} 个")
                 self.rupee_var.set(f"所持的卢比数量: {data.get('RUPEE', '0')} 卢比")
                 ganon_status = data.get('GANON', '0')
                 self.ganon_var.set("已打倒加农" if ganon_status == '1' else "？？？？？")
-                # 三角力量使用位图运算解析（1字节代表8块碎片）
+
                 tf_val = int(data.get('TRIFORCE', '00'), 16)
                 tf_icons = ["▲" if b == "1" else "△" for b in bin(tf_val)[2:].zfill(8)]
                 self.triforce_var.set(f"三角力量收集情况:\n{' '.join(tf_icons)}")
@@ -413,14 +471,13 @@ class BSXSimulator:
         return 0
 
     def start_countdown(self):
-        """ 正式启动流程：开启模拟器，并运行时间逻辑线程与文件监视线程 """
         if not self.timer_running:
             self.timer_running = True
             self.btn_select.config(state="disabled")
             self.btn_stop.config(state="normal")
             for btn in self.chapter_buttons:
                 btn.config(state="disabled")
-            # 在启动模拟器前，先将 0 文件夹内容覆盖到 Satellaview 进行复位
+
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
             reset_dir = os.path.join(self.mesen_dir, "bszelda", "0")
             if os.path.exists(reset_dir):
@@ -433,7 +490,6 @@ class BSXSimulator:
             bs_rom = self.bs_sfc_path
             bs_lua = os.path.join("bs.lua")
             try:
-                # 启动 Mesen 模拟器，并加载对应的 ROM 和 LUA 脚本
                 subprocess.Popen([self.mesen_path, bs_rom, bs_lua])
                 self.root.after(2000, lambda: self._set_mesen_mute(False))
             except (subprocess.SubprocessError, OSError) as err:
@@ -441,13 +497,11 @@ class BSXSimulator:
                 self.reset_system()
                 return
 
-            # 开启双后台线程：一个跑表，一个盯信号
-            threading.Thread(target=self.clock_loop, daemon=True).start()
-            threading.Thread(target=self.signal_monitor_loop, daemon=True).start()
+            threading.Thread(target=self.clock_loop, daemon=True, name="ClockLoopThread").start()
+            threading.Thread(target=self.signal_monitor_loop, daemon=True, name="SignalMonitorThread").start()
 
     def play_settlement_audio(self):
-        """ 结局触发：静音游戏 BGM，播放对应的结局旁白（wav） """
-        logging.info("[系统] 触发结算音频匹配...")
+        logging.info("[音频匹配] 触发结算音频匹配...")
         self.settlement_audio_locked = True
         if self.ganon_mute_timer:
             try:
@@ -456,7 +510,6 @@ class BSXSimulator:
                 pass
         self._set_mesen_mute(True)
 
-        # 确定播放哪个周目的结局音频（优先以 Lua 实时信号为准）
         rom_chapter = self.read_lua_file("chapter_signal.txt")
         final_ch = str(self.selected_chapter)
         if rom_chapter and rom_chapter != "FF":
@@ -477,37 +530,33 @@ class BSXSimulator:
             logging.warning(f"[结局音频] 未找到文件 {os.path.basename(audio_path)}，将保持静音。")
 
     def signal_monitor_loop(self):
-        """ 后台死循环：实时监控 Lua 发出的各种交互信号（加载视频、结算、加农房检测） """
+        logging.info("[线程监控] 信号监听轮询子线程启动成功。")
         while self.timer_running:
-            # 信号1：检测到游戏加载完成信号，触发剧情介绍视频
             if not self.settlement_active and self.read_lua_file("load_complete.txt") == "1":
                 chapter_sig = self.read_lua_file("chapter_signal.txt")
+                logging.info(f"[信号检测] 发现 Lua 载入完毕信号，目标章节/视频: {chapter_sig}")
                 if chapter_sig and chapter_sig != "FF":
                     try:
-                        # 消费完信号后立即回写 0，防止重复触发
-                        with open(os.path.join(self.lua_data_dir, "load_complete.txt"), "w") as f:
-                            f.write("0")
+                        self.write_lua_file("load_complete.txt", "0")
                     except OSError:
                         pass
+                    # 强行切换到主线程中安全拉起剧情视频
                     self.root.after(0, lambda sig=chapter_sig: self.play_story_video(sig))
 
-            # 信号2：检测到结算触发信号
             if not self.settlement_active and self.read_lua_file("settle_trigger.txt") == "READY":
+                logging.info("[信号检测] 发现结算触发器 READY 信号！准备结算渲染...")
                 try:
-                    with open(os.path.join(self.lua_data_dir, "settle_trigger.txt"), "w") as f:
-                        f.write("DONE")
+                    self.write_lua_file("settle_trigger.txt", "DONE")
                 except OSError:
                     pass
                 self.play_settlement_audio()
-                # 延迟10秒弹出成绩单，等待旁白铺垫
                 self.root.after(10000, self.show_custom_settlement_box)
 
-            # 信号3：加农房特殊逻辑控制
             self._handle_ganon_audio_logic()
             time.sleep(SIGNAL_CHECK_INTERVAL)
+        logging.info("[线程监控] 信号监听轮询子线程安全退出。")
 
     def _handle_ganon_audio_logic(self):
-        """ 特殊逻辑：当玩家进入最终 Boss 加农房时，广播音频静音，模拟当年的效果 """
         if self.settlement_audio_locked:
             return
         spawn_state = self.read_lua_file("ganon_spawn.txt")
@@ -518,7 +567,7 @@ class BSXSimulator:
         if result_content and "GANON:1" in result_content:
             is_defeated = True
 
-        if spawn_state == "1":  # 进房
+        if spawn_state == "1":
             if is_defeated:
                 if pygame.mixer.music.get_busy():
                     pygame.mixer.music.stop()
@@ -533,7 +582,7 @@ class BSXSimulator:
                     self.ganon_mute_timer = None
                 logging.info("[音频同步] 玩家进入加农房，音量渐弱...")
                 self._fade_volume(0.0, duration=0.8)
-        elif spawn_state == "0" and self.is_ganon_room_active:  # 出房
+        elif spawn_state == "0" and self.is_ganon_room_active:
             self.is_ganon_room_active = False
             logging.info("[音频同步] 离开加农房，3秒后恢复音量...")
 
@@ -550,7 +599,6 @@ class BSXSimulator:
             self.ganon_mute_timer = self.root.after(3000, delayed_restore)
 
     def _get_mesen_window(self):
-        """ 查找并定位模拟器窗口实例 """
         if self._target_window and self._target_window.visible:
             return self._target_window
         wins = [w for w in gw.getWindowsWithTitle(TARGET_WINDOW_TITLE) if w.visible]
@@ -558,114 +606,238 @@ class BSXSimulator:
         return self._target_window
 
     def play_story_video(self, video_name):
-        """ 视频投影逻辑：在模拟器上方建立透明遮罩并播放 mp4 """
+        """ 视频投影逻辑：在模拟器上方建立透明遮罩并调用 mpv 播放 """
+        # 如果底层仍在进行异步毁灭，利用 after 50ms 后重新检查
+        if getattr(self, '_mpv_destroying', False):
+            logging.warning(f"[播放管道] 检测到旧 MPV 仍在后台销毁，延时 50ms 后重新尝试拉起视频: {video_name}")
+            # 确保 50ms 后正确重试
+            self.root.after(50, lambda: self.play_story_video(video_name))
+            return
+
+        logging.info(f"[播放管道] 收到剧情视频开播请求 -> 名称: {video_name}")
         self._set_mesen_mute(True)
         try:
             curr_time_str = self.time_var.get()
             curr_time_obj = datetime.strptime(curr_time_str, "%H:%M:%S")
-            limit_time = datetime.strptime("18:05:52", "%H:%M:%S")  # 广播正式开始的时间点
-            story_len, wait_len = 135, 168
+            limit_time = datetime.strptime("18:05:52", "%H:%M:%S")
+            story_len, wait_len = 135, 169
         except ValueError:
             return
 
         remaining_sec = (limit_time - curr_time_obj).total_seconds()
         if remaining_sec <= 0:
+            logging.warning("[播放管道] 当前模拟时间已超出临界时间点，不予以播放视频。")
             self._set_mesen_mute(False)
             return
 
-        # 根据剩余时间决定是播放剧情简介还是循环等待视频
         force_wait_sync = (video_name == "wait" or remaining_sec <= story_len)
         if force_wait_sync:
             target_video = os.path.join(self.mesen_dir, "bszelda", "video", "wait.mp4")
-            start_pos = max(0, int(wait_len - remaining_sec))  # 时间戳对齐
+            start_pos = max(0, int(wait_len - remaining_sec))
             self.is_waiting_video_mode = True
+            logging.info(f"[播放管道] 切换为等待平铺视频(wait.mp4)，精准定位绝对进度秒数: {start_pos}")
         else:
             target_video = os.path.join(self.mesen_dir, "bszelda", "video", f"{video_name}.mp4")
             start_pos = 0
             self.is_waiting_video_mode = False
 
         if not os.path.exists(target_video):
+            logging.error(f"[播放管道] 核心视频不存在: {target_video}，直接中断强制归还音频")
             self._set_mesen_mute(False)
             return
 
-        if self.cap:
-            self.cap.release()
-        self.cap = cv2.VideoCapture(target_video)
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, int(start_pos * fps))
+        if self.mpv_player:
+            logging.info("[播放管道] 发现残余旧 MPV 实例，进行前置硬性终止...")
+            try:
+                # 先将事件回调置空，防止 terminate 产生多余的脏路由信号
+                self.mpv_player.event_callback('end-file')(None)
+                self.mpv_player.terminate()
+            except(AttributeError, ValueError):
+                pass
+            self.mpv_player = None
+
         self.is_ending_mode = False
 
-        # 创建或更新全顶层悬浮窗口 (Toplevel)
         if not self.overlay:
             try:
+                logging.info("[UI框架] 创建全新的遮罩窗口 Toplevel")
                 self.overlay = Toplevel(self.root)
-                self.overlay.overrideredirect(True)  # 去掉窗口边框和标题栏
-                self.overlay.attributes("-topmost", True)  # 永远置顶
-                self.canvas = Canvas(self.overlay, bg="black", highlightthickness=0)
-                self.canvas.pack(fill="both", expand=True)
+                self.overlay.overrideredirect(True)
+                self.overlay.attributes("-topmost", True)
             except TclError:
                 self._set_mesen_mute(False)
                 return
-        self._render_loop()
 
-    def _render_loop(self):
-        """ 视频渲染主循环：利用 OpenCV 读取帧并更新到 Tkinter 画布上 """
-        if not self.timer_running or not self.overlay or self.settlement_active:
+        if self.video_frame:
+            try:
+                logging.info("[UI框架] 清理旧视频渲染 Frame 容器")
+                self.video_frame.destroy()
+            except TclError:
+                pass
+            self.video_frame = None
+
+        self.overlay.update_idletasks()
+
+        self.video_frame = Frame(self.overlay, bg="black")
+        self.video_frame.pack(fill="both", expand=True)
+
+        if self.canvas:
+            try:
+                self.canvas.pack_forget()
+            except TclError:
+                pass
+
+        self.overlay.update()
+
+        try:
+            logging.info(f"[MPV内核] 开始挂载底层 MPV C引擎，绑定渲染句柄ID: {self.video_frame.winfo_id()}")
+            self.mpv_player = mpv.MPV(
+                wid=str(self.video_frame.winfo_id()),
+                keep_open='no',
+                hwdec='auto',
+                video_aspect_override='-1'
+            )
+
+            # 跨线程改用原生多线程 Timer 唤醒虚拟信号
+            def _on_end_file_event(_event):
+                if not getattr(self, 'timer_running', False) or getattr(self, 'settlement_active', False):
+                    return
+                logging.info("[MPV事件] 底层播放线程抛出 [视频放完] 事件！拉起绝对安全的异步脱离信号...")
+
+                def _force_trigger():
+                    logging.info(
+                        "[异步事件机制] 定时触发完毕，正在向 Tkinter 主线程队列生成广播事件: <<VideoEndRouting>>")
+                    try:
+                        self.root.event_generate("<<VideoEndRouting>>", when="tail")
+                    except Exception as ge:
+                        logging.error(f"[异步事件机制] 事件注入崩溃: {ge}")
+
+                # 完全脱离 MPV C内核线程的独立 Python 定时驱动器
+                threading.Timer(0.1, _force_trigger).start()
+
+            self.mpv_player.event_callback('end-file')(_on_end_file_event)
+            logging.info("[MPV内核] C层事件回调回调端挂载成功。")
+
+        except Exception as mpv_err:
+            logging.error(f"初始化 MPV 核心失败: {mpv_err}")
+            self._set_mesen_mute(False)
             return
-        start_proc = time.time()
-        ret, frame = self.cap.read()
-        if not ret:
-            # 视频放完后，如果是剧情介绍，则跳转到等待视频；否则关闭
-            if not self.is_ending_mode and not self.is_waiting_video_mode:
-                self.play_story_video("wait")
-                return
-            self.close_overlay()
+
+        self._sync_overlay_geometry()
+
+        if start_pos > 0:
+            has_seeked = False
+
+            @self.mpv_player.event_callback('file-loaded')
+            def _on_file_loaded(_event):
+                nonlocal has_seeked
+                if not has_seeked:
+                    try:
+                        logging.info(f"[MPV内核] 接收到加载完成事件，强制执行跳转 seek -> {start_pos} 秒")
+                        self.mpv_player.seek(start_pos, reference='absolute')
+                        has_seeked = True
+                    except Exception as se:
+                        logging.error(f"[MPV内核] 跳转 seek 翻车: {se}")
+
+        logging.info(f"[MPV内核] 开火放映视频: {os.path.basename(target_video)}")
+        self.mpv_player.play(target_video)
+        self._window_track_loop()
+
+    def _safe_trigger_video_routing(self):
+        """ 安全视频路由缓冲：在主线程中解绑回调，并利用异步子线程毁灭旧 MPV，确保不卡死主线程 """
+        logging.info("[主线程时序] 确认收到 <<VideoEndRouting>> 事件，开始执行【普通视频防死锁安全连招】...")
+        if not self.timer_running or self.settlement_active:
+            logging.warning("[主线程时序] 检测到重置信号或结算已开，强行终止视频路由转换。")
+            return
+
+        if self.mpv_player:
+            try:
+                self.mpv_player.event_callback('end-file')(None)
+
+                self._mpv_destroying = True  # 加锁告诉系统，底层正在毁灭实例
+                old_player = self.mpv_player
+                self.mpv_player = None
+
+                def _async_routing_mpv_destruction(player_instance):
+                    try:
+                        player_instance['wid'] = 0
+                        player_instance.stop()
+                        player_instance.terminate()
+                    except (AttributeError, ValueError):
+                        pass
+                    finally:
+                        self._mpv_destroying = False  # 释放保护锁
+
+                threading.Thread(target=_async_routing_mpv_destruction, args=(old_player,), daemon=True).start()
+
+            except Exception as e:
+                logging.error(f"[防死锁连招] 剥离动作出现未预期异常: {e}")
+
+        # 主线程继续向前推进，执行下一步的视频/结算状态调度
+        self._handle_video_end_routing()
+
+    def _handle_video_end_routing(self):
+        if not self.timer_running or self.settlement_active:
+            return
+        if not self.is_ending_mode and not self.is_waiting_video_mode:
+            logging.info("[路由控制] 刚刚播放完普通剧情视频，开始无缝衔接至等待背景 wait.mp4...")
+            self.play_story_video("wait")
+            return
+        logging.info("[路由控制] 等待视频或结局放映完成，开始执行全盘遮罩关闭...")
+        self.close_overlay()
+
+    def _window_track_loop(self):
+        if not self.timer_running or not self.overlay or self.settlement_active:
             return
 
         if not self.is_ending_mode:
-            # 如果到达 18:05:52 广播正式点，强制关闭视频遮罩回到游戏界面
             if self.time_var.get() >= "18:05:52":
+                logging.info("[时间追踪] 已到达临界时间点 18:05:52，强制卸载游戏内视频投影")
                 self.close_overlay()
                 return
 
+        self._sync_overlay_geometry()
+        self.root.after(30, self._window_track_loop)
+
+    def _sync_overlay_geometry(self):
         m = self._get_mesen_window()
         cw, ch, cx, cy = 256, 224, 0, 0
         if m:
             try:
                 hwnd = getattr(m, '_hWnd', None)
                 if hwnd:
-                    # 动态追踪模拟器位置和大小
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
                 if self.overlay.geometry() != f"{cw}x{ch}+{cx}+{cy}":
                     self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
-
-                # 图像转换：OpenCV (BGR) -> PIL (RGB) -> Tkinter PhotoImage
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = ImageTk.PhotoImage(Image.fromarray(cv2.resize(rgb, (cw, ch))))
-
-                if self.image_ptr is None:
-                    self.image_ptr = self.canvas.create_image(0, 0, anchor="nw", image=img)
-                else:
-                    self.canvas.itemconfig(self.image_ptr, image=img)
-                self.tk_image_cache = img  # 关键：缓存引用防止回收导致白屏
             except (TclError, Exception):
                 pass
 
-        # 控制渲染帧率，使其匹配视频 FPS
-        fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
-        delay = max(1, int((1000 / fps) - (time.time() - start_proc) * 1000))
-        self.root.after(delay, self._render_loop)
-
     def close_overlay(self):
-        """ 安全销毁遮罩窗口和相关资源 """
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        self._clear_animation_timers()
+        logging.info("[释放进程] 全盘大清扫：正在彻底关闭、销毁、重置所有多媒体和图形容器...")
 
-        # 1. 恢复模拟器声音
+        # 将 MPV 的物理超度完全移出主线程
+        if self.mpv_player:
+            def _async_mpv_destruction(player_instance):
+                logging.info("[异步释放] 已在子线程中接管旧 MPV，开始离线剥离物理实例...")
+                try:
+                    # 子线程销毁前，同样先解绑事件
+                    player_instance.event_callback('end-file')(None)
+                    player_instance['wid'] = 0
+                    player_instance.stop()
+                    player_instance.terminate()
+                    logging.info("[异步释放] 旧 MPV 实例在子线程中已彻底灰飞烟灭。")
+                except Exception as ae:
+                    logging.debug(f"[异步释放] 剥离期间细节捕获（可安全忽略）: {ae}")
+
+            # 启动一个独立的、专门用来收容和毁灭 MPV 的僵尸线程
+            threading.Thread(target=_async_mpv_destruction, args=(self.mpv_player,), daemon=True,
+                             name="MpvDestructionThread").start()
+            self.mpv_player = None
+
+        # 主线程继续往下走，立刻恢复模拟器的音量
         self._set_mesen_mute(False)
 
-        # 2. 只有在结局视频（ED）放完关闭时，才执行 0 文件夹的复位覆盖
         if self.is_ending_mode and self.mesen_dir:
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
             reset_dir = os.path.join(self.mesen_dir, "bszelda", "0")
@@ -676,45 +848,44 @@ class BSXSimulator:
                         shutil.copy2(os.path.join(reset_dir, item), os.path.join(sat_dir, item))
                     except (shutil.Error, OSError) as e:
                         logging.error(f"[结局复位失败] 无法拷贝初始文件 {item}: {e}")
-                logging.info("[系统复位] 检测到结局视频播放完毕，已自动恢复 0 文件夹初始数据。")
+                logging.info("[系统复位] 结局视频播放完毕，广播文件夹已恢复原始状态。")
 
-        # 3. 销毁 Tkinter 遮罩组件及清理状态
         if self.overlay:
             try:
+                logging.info("[释放进程] 主线程执行：彻底灰飞烟灭遮罩主窗口")
                 self.overlay.destroy()
             except TclError:
                 pass
-            self.overlay, self.image_ptr, self.settlement_active = None, None, False
-        self.tk_image_cache = None
+            self.overlay, self.canvas, self.video_frame, self.settlement_active = None, None, None, False
         self.triforce_frames = []
         self.ui_refs = []
         self._last_geo = ""
+        logging.info("[释放进程] 主线程大清扫指令下达完毕，主界面已完全恢复自由操作！")
 
     def clock_loop(self):
-        """ 模拟“广播时间”的虚拟时钟循环 """
+        logging.info("[线程监控] 模拟卫星时钟主循环子线程已开始工作。")
         try:
             start_real = time.time()
             start_sim = datetime.strptime(self.time_var.get(), "%H:%M:%S")
             while self.timer_running:
-                # 模拟时钟 = 初始虚拟时间 + (当前系统时间 - 启动时系统时间)
                 curr_sim = (start_sim + timedelta(seconds=time.time() - start_real)).strftime("%H:%M:%S")
                 self.time_var.set(curr_sim)
                 if curr_sim == "18:00:00" and not self.has_triggered_1800:
+                    logging.info("[卫星广播] 叮！时间已到 18:00:00！执行卫星信号强行空投推送...")
                     self.trigger_broadcast_and_audio()
                     self.has_triggered_1800 = True
                 time.sleep(0.1)
         except ValueError:
             pass
+        logging.info("[线程监控] 模拟卫星时钟主循环子线程已停止。")
 
     def trigger_broadcast_and_audio(self):
-        """ 18:00 关键动作：拷贝卫星广播文件到模拟器目录，并开始播放音频 wav """
         sat_dir = os.path.join(self.mesen_dir, "Satellaview")
         ch_dir = os.path.join(self.mesen_dir, "bszelda", str(self.selected_chapter))
         if os.path.exists(ch_dir):
             os.makedirs(sat_dir, exist_ok=True)
             for item in os.listdir(ch_dir):
                 try:
-                    # 模拟卫星下发数据：将文件拷入模拟器预设目录
                     shutil.copy2(os.path.join(ch_dir, item), os.path.join(sat_dir, item))
                 except (shutil.Error, OSError):
                     continue
@@ -724,11 +895,11 @@ class BSXSimulator:
             try:
                 pygame.mixer.music.load(audio_path)
                 pygame.mixer.music.play()
+                logging.info(f"[广播音频] 正在播放主流程广播配音: {os.path.basename(audio_path)}")
             except Exception as e:
                 logging.error(f"广播音频播放失败: {e}")
 
     def _settlement_sync_loop(self):
-        """ 结算界面的位置同步循环（确保遮罩始终跟着模拟器窗口走） """
         if not self.settlement_active or not self.overlay:
             return
         m = self._get_mesen_window()
@@ -740,7 +911,6 @@ class BSXSimulator:
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
                 if self._last_geo != f"{cw}x{ch}+{cx}+{cy}":
                     self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
-                    # 如果窗口大小变了，需要重新渲染内容以适配缩放
                     if self._last_geo != "":
                         self._render_settlement_content(cw, ch)
                     self._last_geo = f"{cw}x{ch}+{cx}+{cy}"
@@ -749,21 +919,41 @@ class BSXSimulator:
         self.root.after(100, self._settlement_sync_loop)
 
     def show_custom_settlement_box(self):
-        """ 弹出成绩结算遮罩窗口 """
         if self.settlement_active:
             return
+        logging.info("[结算渲染] 核心方法 show_custom_settlement_box 被调用，开始创建画布布局...")
         self.settlement_active = True
+
+        if self.mpv_player:
+            try:
+                # 进入结算单前清除可能残留的回调
+                self.mpv_player.event_callback('end-file')(None)
+                self.mpv_player.terminate()
+            except (AttributeError, ValueError):
+                pass
+            self.mpv_player = None
+
         cw, ch, cx, cy = 256, 224, 0, 0
         if not self.overlay:
             try:
                 self.overlay = Toplevel(self.root)
                 self.overlay.overrideredirect(True)
                 self.overlay.attributes("-topmost", True)
-                self.canvas = Canvas(self.overlay, bg="black", highlightthickness=0)
-                self.canvas.pack(fill="both", expand=True)
             except TclError:
                 self.settlement_active = False
                 return
+
+        if self.video_frame:
+            try:
+                self.video_frame.pack_forget()
+            except TclError:
+                pass
+
+        if not self.canvas:
+            self.canvas = Canvas(self.overlay, bg="black", highlightthickness=0)
+
+        self.canvas.pack(fill="both", expand=True)
+
         m = self._get_mesen_window()
         if not m:
             self.close_overlay()
@@ -777,8 +967,8 @@ class BSXSimulator:
         self._settlement_sync_loop()
 
     def _render_settlement_content(self, cw, ch):
-        """ 绘制美化版的成绩单：包括背景图、数据文字和动态的三角力量 """
         try:
+            self._clear_animation_timers()
             self.canvas.delete("all")
             tf_val = self.update_settlement_display()
             rom_chapter = self.read_lua_file("chapter_signal.txt")
@@ -788,50 +978,54 @@ class BSXSimulator:
                 if match:
                     final_ch = match.group(1)
 
-            # 1. 绘制背景图
             bg_path = os.path.join("ui", "bg_result.png")
             if os.path.exists(bg_path):
                 bg_img = Image.open(bg_path).resize((cw, ch), Image.Resampling.LANCZOS)
                 self.bg_image_ref = ImageTk.PhotoImage(bg_img)
                 self.canvas.create_image(0, 0, anchor="nw", image=self.bg_image_ref)
 
-            # 2. 绘制标题文字
-            f_size = int(ch * 0.045)
-            self.canvas.create_text(cw / 2, ch * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
+            # 所有作用于 Canvas 内部的数值均除以缩放比
+            scale = self.dpi_scale
+
+            # 基础字号转换（转换为逻辑字号避免 Tkinter 二次放大）
+            f_size = max(9, int((ch * 0.045) / scale))
+            tf_size_val = int((cw * 0.055) / scale)
+
+            # 逻辑坐标计算
+            logical_cw = cw / scale
+            logical_ch = ch / scale
+
+            self.canvas.create_text(logical_cw / 2, logical_ch * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
                                     font=("Verdana", f_size))
-            self.canvas.create_text(cw / 2, ch * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
+            self.canvas.create_text(logical_cw / 2, logical_ch * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
                                     font=("Verdana", f_size))
 
-            # 3. 绘制核心数据行
-            label_x, value_x, curr_y, spacing = cw * 0.15, cw * 0.42, ch * 0.30, ch * 0.09
+            label_x, value_x, curr_y, spacing = logical_cw * 0.15, logical_cw * 0.42, logical_ch * 0.30, logical_ch * 0.09
+
             self.canvas.create_text(label_x, curr_y, text=self.ganon_var.get(), fill="#FFFFFF",
                                     font=("Verdana", f_size), anchor="w")
             curr_y += spacing
             self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=("Verdana", f_size),
                                     anchor="w")
 
-            # 4. 绘制动态三角力量图标
-            tf_size_val = int(cw * 0.055)
+            # 缩放适配的 GIF 帧大小（物理像素需求）
             self.triforce_frames = self._load_gif_frames(
-                os.path.join("ui", "triforce_on.gif"), (tf_size_val, tf_size_val))
+                os.path.join("ui", "triforce_on.gif"), (int(cw * 0.055), int(cw * 0.055)))
             off_path = os.path.join("ui", "triforce_off.png")
 
-            # 解析 8 位二进制位，对应 8 个碎片
             tf_bits = [int(b) for b in bin(tf_val)[2:].zfill(8)]
             for i, bit in enumerate(tf_bits):
-                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int(cw * 0.01)))
+                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int((cw * 0.01) / scale)))
                 if bit == 1 and self.triforce_frames:
-                    # 拥有碎片：绘制 GIF 帧并开启循环动画
                     img_id = self.canvas.create_image(cur_x, curr_y, image=self.triforce_frames[0], anchor="center")
                     self._animate_triforce(img_id, 0)
                 elif os.path.exists(off_path):
-                    # 未拥有碎片：绘制灰色静态图片
+                    # 物理像素缩放
                     off_img = ImageTk.PhotoImage(
-                        Image.open(off_path).resize((tf_size_val, tf_size_val), Image.Resampling.LANCZOS))
+                        Image.open(off_path).resize((int(cw * 0.055), int(cw * 0.055)), Image.Resampling.LANCZOS))
                     self.canvas.create_image(cur_x, curr_y, image=off_img, anchor="center")
                     self.ui_refs.append(off_img)
 
-            # 5. 绘制其他统计项
             labels = ["重新开始的次数", "损失的心心数量", "所持的卢比数量"]
             vals = [self.death_var.get().split(":")[-1].strip(), self.heart_var.get().split(":")[-1].strip(),
                     self.rupee_var.get().split(":")[-1].strip()]
@@ -839,15 +1033,18 @@ class BSXSimulator:
                 curr_y += spacing
                 self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=("Verdana", f_size),
                                         anchor="w")
-                self.canvas.create_text(cw * 0.85, curr_y, text=vals[i], fill="#FFFFFF", font=("Verdana", f_size),
+                self.canvas.create_text(logical_cw * 0.85, curr_y, text=vals[i], fill="#FFFFFF",
+                                        font=("Verdana", f_size),
                                         anchor="e")
 
-            # 6. 交互提示
-            self.canvas.create_rectangle(cw * 0.1, ch * 0.85, cw * 0.9, ch * 0.93, outline="#F1C40F", width=3)
-            self.canvas.create_text(cw / 2, ch * 0.89, text="点击屏幕查看下一页", fill="#FFFFFF",
+            self.canvas.create_rectangle(logical_cw * 0.1, logical_ch * 0.85, logical_cw * 0.9, logical_ch * 0.93,
+                                         outline="#F1C40F", width=2)
+
+            self.canvas.create_text(logical_cw / 2, logical_ch * 0.89, text="按下任意键继续", fill="#FFFFFF",
                                     font=("Verdana", f_size))
-            # 绑定左键点击事件，进入最终结局视频
-            self.canvas.bind("<Button-1>", lambda _event: self.play_ending_video())
+
+            logging.info("[结算渲染] 画布第一页内容抗 DPI 缩放适配渲染完毕。")
+
         except TclError:
             pass
         except (AttributeError, FileNotFoundError, OSError) as data_err:
@@ -855,19 +1052,113 @@ class BSXSimulator:
         except Exception as unknown_err:
             logging.error(f"未预期的渲染异常: {unknown_err}")
 
+        # 全局异步硬件盲听
+        self._has_triggered_next = False
+        self._stop_global_check = False
+
+        def _trigger_next_page():
+            if self._has_triggered_next:
+                return
+            self._has_triggered_next = True
+            self._stop_global_check = True  # 刹车，停掉高频循环
+            self.play_ending_video()
+
+        # 强抓一次焦点，尽量建立友好的输入环境
+        try:
+            if self.overlay and self.overlay.winfo_exists():
+                self.overlay.update()
+                self.overlay.deiconify()
+                self.overlay.focus_force()
+                ctypes.windll.user32.SetForegroundWindow(self.overlay.winfo_id())
+        except (TclError, OSError):
+            pass
+
+        # 启动 XInput + Win32 全局双重硬件轮询
+        self._poll_global_input(_trigger_next_page)
+
+    def _poll_global_input(self, trigger_callback):
+        """ 全外设盲听：GetAsyncKeyState(键盘) + XInput底层(手柄) """
+        if hasattr(self, '_stop_global_check') and self._stop_global_check:
+            return
+
+        try:
+            triggered = False
+
+            # === 1. 跨进程全局键盘盲听（键盘） ===
+            for vk_code in range(8, 256):
+                if vk_code in (1, 2):  # 过滤鼠标左右键点击
+                    continue
+                if ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000:
+                    logging.info(f"[全局硬件触发] 检测到键盘按键 VK_{vk_code} 按下")
+                    triggered = True
+                    break
+
+            # === 2. XInput 全局手柄检测（手柄） ===
+            if not triggered:
+                # 声明 XInput 手柄状态结构体类型
+                class XinputButtons(ctypes.Structure):
+                    _fields_ = [("wButtons", ctypes.c_ushort)]
+
+                class XinputState(ctypes.Structure):
+                    _fields_ = [("dwPacketNumber", ctypes.c_ulong), ("Gamepad", XinputButtons)]
+
+                state = XinputState()
+
+                # 盲听 0 到 3 号位（支持多达 4 个手柄接入）
+                for user_index in range(4):
+                    # 尝试调用 Windows 系统的 XInput1_4 或 9_1_0 驱动读取状态
+                    # 0 代表 ERROR_SUCCESS（成功读取到该序号的手柄输入）
+                    res = ctypes.windll.xinput1_4.XInputGetState(user_index, ctypes.byref(state))
+                    if res != 0:
+                        # 如果系统找不到 XInput1_4 (比如老系统)，自动退回旧版通用驱动尝试
+                        res = ctypes.windll.xinput9_1_0.XInputGetState(user_index, ctypes.byref(state))
+
+                    if res == 0:
+                        # 读取当前时刻手柄按下的二进制按键掩码
+                        buttons_mask = state.Gamepad.wButtons
+                        # 只要掩码大于 0，说明玩家正在按手柄上的任意键（A/B/X/Y/方向键/肩键/菜单键等）
+                        if buttons_mask > 0:
+                            logging.info(f"[全局硬件触发] 检测到 {user_index} 号手柄按键掩码 {buttons_mask} 处于激活态")
+                            triggered = True
+                            break
+
+            if triggered:
+                trigger_callback()
+                return
+
+        except Exception as e:
+            logging.debug(f"[内核级全局轮询异常] {e}")
+
+        # 每 25 毫秒抽样一次（40 FPS，兼顾零延迟与超低 CPU 占用）
+        if self.overlay and self.overlay.winfo_exists():
+            self.overlay.after(25, lambda: self._poll_global_input(trigger_callback))
+
     def _animate_triforce(self, img_id, frame_idx):
-        """ 递归调用实现 GIF 帧切换，实现三角力量的动态效果 """
         if not self.overlay or not self.settlement_active:
             return
         try:
             idx = (frame_idx + 1) % len(self.triforce_frames)
             self.canvas.itemconfig(img_id, image=self.triforce_frames[idx])
-            self.root.after(100, lambda: self._animate_triforce(img_id, idx))
+            # 记录生成的定时器 ID
+            t_id = self.root.after(100, lambda: self._animate_triforce(img_id, idx))
+            # 每次只保留当前生效的活跃动画句柄，防止长时间挂机列表无意义膨胀
+            self._anim_timers = [tid for tid in self._anim_timers if tid != t_id]
+            self._anim_timers.append(t_id)
         except (TclError, Exception):
             pass
 
+    def _clear_animation_timers(self):
+        """在重绘或销毁遮罩前，强行截断并清理所有残留的后台动画定时器"""
+        for t_id in self._anim_timers:
+            try:
+                self.root.after_cancel(t_id)
+            except TclError:
+                pass
+        self._anim_timers.clear()
+
     def play_ending_video(self):
         """ 播放结局视频逻辑（当成绩单被点击后触发） """
+        logging.info("[结局跳转] 检测到成绩单被点击，准备退出成绩结算画布，切入大结局视频...")
         self.settlement_active = False
         rom_chapter = self.read_lua_file("chapter_signal.txt")
         final_ch = str(self.selected_chapter)
@@ -877,25 +1168,108 @@ class BSXSimulator:
                 final_ch = match.group(1)
         video_p = os.path.join(self.mesen_dir, "bszelda", "video", f"ED{final_ch}.mp4")
         if os.path.exists(video_p):
-            if self.cap:
-                self.cap.release()
-            self.cap, self.is_ending_mode, self.image_ptr = cv2.VideoCapture(video_p), True, None
             try:
                 self.canvas.delete("all")
-                self.canvas.unbind("<Button-1>")  # 解除点击绑定
+                self.canvas.unbind("<Button-1>")
+                self.canvas.pack_forget()
             except (TclError, Exception):
                 pass
-            logging.info(f"[结局视频] 成功播放: {os.path.basename(video_p)}")
-            self._render_loop()
+
+            if self.video_frame:
+                try:
+                    self.video_frame.destroy()
+                except TclError:
+                    pass
+                self.video_frame = None
+
+            self.overlay.update_idletasks()
+
+            self.video_frame = Frame(self.overlay, bg="black")
+            self.video_frame.pack(fill="both", expand=True)
+
+            if self.mpv_player:
+                try:
+                    # 切入大结局前清除可能残留的回调
+                    self.mpv_player.event_callback('end-file')(None)
+                    self.mpv_player.terminate()
+                except (AttributeError, ValueError):
+                    pass
+                self.mpv_player = None
+
+            self.is_ending_mode = True
+            logging.info(f"[结局视频] 文件存在，开始组装 MPV。")
+
+            self.overlay.update()
+
+            try:
+                self.mpv_player = mpv.MPV(
+                    wid=str(self.video_frame.winfo_id()),
+                    keep_open='no',
+                    hwdec='auto',
+                    video_aspect_override='-1'
+                )
+
+                def _on_ending_file_event(_event):
+                    logging.info("[MPV事件] 底层结局视频播放完毕，抛出异步解离关闭信号...")
+
+                    def _force_trigger_ending():
+                        logging.info("[异步事件机制] 正在向 Tkinter 主线程队列生成结局关闭广播事件: <<EndingClose>>")
+                        try:
+                            self.root.event_generate("<<EndingClose>>", when="tail")
+                        except Exception as ge:
+                            logging.error(f"[异步事件机制] 结局事件注入崩溃: {ge}")
+
+                    threading.Timer(0.1, _force_trigger_ending).start()
+
+                self.mpv_player.event_callback('end-file')(_on_ending_file_event)
+            except Exception as mpv_err:
+                logging.error(f"结局视频初始化 MPV 核心失败: {mpv_err}")
+                self.close_overlay()
+                return
+
+            self._sync_overlay_geometry()
+            logging.info(f"[MPV内核] 开始放映大结局视频: {os.path.basename(video_p)}")
+            self.mpv_player.play(video_p)
+            self._window_track_loop()
         else:
             logging.warning(f"[结局视频] 未找到文件 {os.path.basename(video_p)}，直接关闭遮罩。")
             self.close_overlay()
 
+    def _safe_trigger_ending_close(self):
+        """ 结局视频放完后的安全关闭：解除结算音频锁，并利用异步全盘清扫机制规避死锁 """
+        logging.info("[主线程时序] 确认收到 <<EndingClose>> 事件，开始执行【结局防死锁安全解锁连招】...")
+
+        # 1. 解除音量锁，确保后续能够顺利恢复模拟器的声音
+        self.settlement_audio_locked = False
+
+        # 2. 如果 pygame 后台还在播放大结局的 WAV 广播配音，一并强行停掉
+        try:
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        except Exception as pg_unload_err:
+            logging.warning(f"[音频重建] 监测到音频硬件异常，正在强行重启 Pygame 驱动: {pg_unload_err}")
+            try:
+                pygame.mixer.quit()
+                pygame.mixer.init()
+            except pygame.error:
+                pass
+
+        # 3. 在主线程中只做事件解绑
+        if self.mpv_player:
+            try:
+                self.mpv_player.event_callback('end-file')(None)
+            except (AttributeError, ValueError):
+                pass
+
+        # 4.启动独立子线程去毁灭 MPV 实例，并在主线程中销毁组件、恢复模拟器声音、复位广播文件夹
+        self.close_overlay()
+
     def run(self):
-        """ 运行 Tkinter 事件循环 """
+        logging.info("[系统启动] BS 塞尔达传说 广播模拟终端主窗体 Mainloop 开启。")
         self.root.mainloop()
+        logging.info("[系统关闭] 主窗体 Mainloop 已退出。")
 
 
 if __name__ == "__main__":
-    # 程序入口：实例化对象并运行
     BSXSimulator().run()
