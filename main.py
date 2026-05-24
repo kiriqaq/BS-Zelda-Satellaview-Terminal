@@ -10,7 +10,8 @@ import threading
 import time
 from ctypes import windll, wintypes
 from datetime import datetime, timedelta
-from tkinter import (Tk, Label, filedialog, StringVar, Button, Frame, Toplevel, Canvas, messagebox, TclError)
+from tkinter import (Tk, Label, filedialog, StringVar, Checkbutton, Button, Frame, Toplevel, Canvas, messagebox,
+                     TclError)
 
 import pygame
 import pygetwindow as gw
@@ -31,9 +32,9 @@ if hasattr(os, "add_dll_directory"):
 
 # 同时确保环境变量 PATH 把这两个地方全部覆盖，防止老系统加载失败
 os.environ["PATH"] = (
-    _CURRENT_DIR + os.pathsep +
-    _INTERNAL_DIR + os.pathsep +
-    os.environ.get("PATH", "")
+        _CURRENT_DIR + os.pathsep +
+        _INTERNAL_DIR + os.pathsep +
+        os.environ.get("PATH", "")
 )
 
 # 引入 MPV 核心库
@@ -92,8 +93,8 @@ class BSXSimulator:
         self.root = Tk()
         self.root.title("BS 塞尔达传说 广播终端")
 
-        window_w = int(400 * self.dpi_scale)
-        window_h = int((870 if self.show_debug_ui else 470) * self.dpi_scale)
+        window_w = int(450 * self.dpi_scale)
+        window_h = int((920 if self.show_debug_ui else 500) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
@@ -139,6 +140,9 @@ class BSXSimulator:
         self.rupee_var = StringVar(value="所持的卢比数量: -- 卢比")
         self.triforce_var = StringVar(value="三角力量收集情况:\n△ △ △ △ △ △ △ △")
         self.ganon_var = StringVar(value="？？？？？")
+        # 初始化画面比例控制变量，默认开启(true)
+        self.keep_aspect_ratio_var = StringVar(value="true")
+        self._overlay_minimized_by_mesen = False
 
         self._setup_ui()
 
@@ -312,6 +316,17 @@ class BSXSimulator:
                                       state="disabled", fg="#c0392b")
         self.btn_delete_save.pack(pady=5)
 
+        # 画面比例控制勾选框
+        self.chk_aspect = Checkbutton(
+            self.root,
+            text="保持画面比例（防止拉伸变形）",
+            variable=self.keep_aspect_ratio_var,
+            onvalue="true",
+            offvalue="false",
+            activebackground=self.root.cget("bg")
+        )
+        self.chk_aspect.pack(pady=5)
+
         if self.show_debug_ui:
             monitor_section = Frame(self.root, pady=10, padx=20, relief="groove", borderwidth=2)
             monitor_section.pack(fill="x", padx=20, pady=10)
@@ -417,6 +432,7 @@ class BSXSimulator:
         self.is_ending_mode = False
         self.btn_stop.config(state="disabled")
         self._activate_chapter_selection()
+        self.chk_aspect.config(state="normal")
         logging.info("[系统指令] 系统复位完毕。")
 
     def read_lua_file(self, filename, retries=2):
@@ -477,6 +493,7 @@ class BSXSimulator:
             self.btn_stop.config(state="normal")
             for btn in self.chapter_buttons:
                 btn.config(state="disabled")
+            self.chk_aspect.config(state="disabled")
 
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
             reset_dir = os.path.join(self.mesen_dir, "bszelda", "0")
@@ -691,11 +708,18 @@ class BSXSimulator:
 
         try:
             logging.info(f"[MPV内核] 开始挂载底层 MPV C引擎，绑定渲染句柄ID: {self.video_frame.winfo_id()}")
+
+            # 根据 UI 勾选框状态动态决定 MPV 参数
+            is_keep = (self.keep_aspect_ratio_var.get() == "true")
+            mpv_keepaspect = 'yes' if is_keep else 'no'
+            mpv_aspect_override = '-1' if is_keep else 'no'
+
             self.mpv_player = mpv.MPV(
                 wid=str(self.video_frame.winfo_id()),
                 keep_open='no',
                 hwdec='auto',
-                video_aspect_override='-1'
+                keepaspect=mpv_keepaspect,
+                video_aspect_override=mpv_aspect_override
             )
 
             # 跨线程改用原生多线程 Timer 唤醒虚拟信号
@@ -806,15 +830,57 @@ class BSXSimulator:
             try:
                 hwnd = getattr(m, '_hWnd', None)
                 if hwnd:
+                    # 1. 声明 Windows 核心位置状态结构体
+                    class WINDOWPLACEMENT(ctypes.Structure):
+                        _fields_ = [
+                            ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
+                            ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
+                            ("rcNormalPosition", ctypes.c_long * 4)  # 包含正常状态下的 [left, top, right, bottom]
+                        ]
+
+                    wp = WINDOWPLACEMENT()
+                    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+
+                    is_minimized = False
+                    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                        # showCmd == 2 代表处于最小化状态
+                        if wp.showCmd == 2:
+                            is_minimized = True
+
+                    # 2. 状态平滑流转逻辑
+                    if is_minimized:
+                        if not self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = True
+                            if self.overlay and self.overlay.winfo_exists():
+                                self.overlay.withdraw()  # 视觉隐藏，防穿帮
+                                logging.info("[同步状态] 检测到模拟器已最小化，平滑隐藏遮罩窗口。")
+                    else:
+                        if self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = False
+                            if self.overlay and self.overlay.winfo_exists():
+                                self.overlay.deiconify()  # 恢复可见
+                                logging.info("[同步状态] 检测到模拟器已恢复正常，重新唤醒遮罩覆盖。")
+
+                    # 3. 【高能避坑】无论是否最小化，都必须强制完成真实的像素坐标和高宽计算！
+                    # 这样在视频初始化、切换视频瞬间，即使最小化，MPV 也能拿到安全有效的非零几何数据
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
-                if self.overlay.geometry() != f"{cw}x{ch}+{cx}+{cy}":
-                    self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
-            except (TclError, Exception):
-                pass
+
+                # 4. 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底，绝对不给内核报错的机会
+                if cw <= 0 or ch <= 0:
+                    cw, ch, cx, cy = 256, 224, 0, 0
+
+                if self.overlay and self.overlay.winfo_exists():
+                    geom_str = f"{cw}x{ch}+{cx}+{cy}"
+                    if self.overlay.geometry() != geom_str:
+                        self.overlay.geometry(geom_str)
+
+            except (TclError, Exception) as e:
+                logging.debug(f"[同步几何体异常] {e}")
 
     def close_overlay(self):
         self._clear_animation_timers()
         logging.info("[释放进程] 全盘大清扫：正在彻底关闭、销毁、重置所有多媒体和图形容器...")
+        self._overlay_minimized_by_mesen = False
 
         # 将 MPV 的物理超度完全移出主线程
         if self.mpv_player:
@@ -900,23 +966,75 @@ class BSXSimulator:
                 logging.error(f"广播音频播放失败: {e}")
 
     def _settlement_sync_loop(self):
-        if not self.settlement_active or not self.overlay:
+        """ 针对结算界面的超高精度同步时钟：完美防范玩家在成绩单界面反复最小化/恢复 """
+        if not self.settlement_active or not self.overlay or not self.overlay.winfo_exists():
             return
+
         m = self._get_mesen_window()
-        cw, ch, cx, cy = 256, 224, 0, 0
         if m:
             try:
                 hwnd = getattr(m, '_hWnd', None)
                 if hwnd:
+                    # 1. 获取 Windows 窗口当前的真实显示放置状态
+                    class WINDOWPLACEMENT(ctypes.Structure):
+                        _fields_ = [
+                            ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
+                            ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
+                            ("rcNormalPosition", ctypes.c_long * 4)
+                        ]
+
+                    wp = WINDOWPLACEMENT()
+                    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+
+                    is_minimized = False
+                    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                        if wp.showCmd == 2:  # 2 = SW_SHOWMINIMIZED（最小化状态）
+                            is_minimized = True
+
+                    # 2. 如果顽皮玩家在结算界面又最小化了模拟器
+                    if is_minimized:
+                        if not self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = True
+                            self.overlay.withdraw()  # 随动隐形，保证桌面不穿帮
+                            logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
+
+                        # 【核心防御】拦截住！千万不要去执行后续错误的 0x0 图形刷新，静默等待复原
+                        self.root.after(30, self._settlement_sync_loop)
+                        return
+
+                    # 3. 如果玩家又把模拟器从任务栏里点开了（恢复正常）
+                    else:
+                        if self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = False
+                            self.overlay.deiconify()  # 随动恢复可见
+                            logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
+
+                            # 刚复活瞬间强制洗牌，重新填满画面
+                            cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                            if cw > 0 and ch > 0:
+                                self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
+                                self._render_settlement_content(cw, ch)
+
+                    # 4. 处于未最小化的普通游玩/拉伸状态，执行你原汁原味的几何同步
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
-                if self._last_geo != f"{cw}x{ch}+{cx}+{cy}":
-                    self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
-                    if self._last_geo != "":
-                        self._render_settlement_content(cw, ch)
-                    self._last_geo = f"{cw}x{ch}+{cx}+{cy}"
-            except (TclError, Exception):
-                pass
-        self.root.after(100, self._settlement_sync_loop)
+                    if cw > 0 and ch > 0:
+                        geo_str = f"{cw}x{ch}+{cx}+{cy}"
+                        if self._last_geo != geo_str:
+                            self._last_geo = geo_str
+                            self.overlay.geometry(geo_str)
+                            # 如果玩家拉伸或拖动了窗口，完美触发你的 Canvas 刷新逻辑
+                            self._render_settlement_content(cw, ch)
+            except (TclError, Exception) as loop_err:
+                logging.debug(f"[结算同步环异常] {loop_err}")
+        else:
+            # 如果玩家在结算单界面直接把模拟器关掉了，执行全盘安全熔断
+            logging.warning("[结算守护] 丢失模拟器句柄，安全熔断清理。")
+            self.close_overlay()
+            return
+
+        # 维持高频同步（将 100ms 提速至 30ms 带来商业级丝滑跟踪感，你也可以改成 100）
+        if self.settlement_active and self.overlay and self.overlay.winfo_exists():
+            self.root.after(30, self._settlement_sync_loop)
 
     def show_custom_settlement_box(self):
         if self.settlement_active:
@@ -958,11 +1076,52 @@ class BSXSimulator:
         if not m:
             self.close_overlay()
             return
+
         hwnd = getattr(m, '_hWnd', None)
         if hwnd:
+            # === 【完美切入点】在这里拦截并强行恢复最小化的模拟器 ===
+            try:
+                # 向 Windows 查询当前模拟器的放置状态
+                class WINDOWPLACEMENT(ctypes.Structure):
+                    _fields_ = [
+                        ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
+                        ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
+                        ("rcNormalPosition", ctypes.c_long * 4)
+                    ]
+
+                wp = WINDOWPLACEMENT()
+                wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+
+                if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                    # showCmd == 2 代表当前确实处于最小化状态
+                    if wp.showCmd == 2:
+                        # 9 = SW_RESTORE (从任务栏恢复)
+                        ctypes.windll.user32.ShowWindow(hwnd, 9)
+                        # 5 = SW_SHOW (显式展示窗口)
+                        ctypes.windll.user32.ShowWindow(hwnd, 5)
+                        # 将模拟器强行拉到屏幕最前台
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        logging.info("[结算唤醒] 检测到模拟器处于最小化，已成功恢复并强抬至前台。")
+
+                        # 【时序补丁】强抬可能需要微小的系统级刷新时间，让 Win32 响应后再读取最新位置
+                        time.sleep(0.05)
+            except Exception as e:
+                logging.debug(f"[结算唤醒异常] {e}")
+
+            # 此时模拟器已经物理复位，计算出来的绝对是最精准的正常高宽！
             cw, ch, cx, cy = self._get_client_geometry(hwnd)
+
         self._last_geo = f"{cw}x{ch}+{cx}+{cy}"
         self.overlay.geometry(self._last_geo)
+
+        # 顺便确保由于随动最小化被隐藏(withdraw)的遮罩被重新唤醒
+        if self._overlay_minimized_by_mesen:
+            self._overlay_minimized_by_mesen = False
+            try:
+                self.overlay.deiconify()
+            except TclError:
+                pass
+
         self._render_settlement_content(cw, ch)
         self._settlement_sync_loop()
 
@@ -1202,11 +1361,17 @@ class BSXSimulator:
             self.overlay.update()
 
             try:
+                # 根据 UI 勾选框状态动态决定大结局 MPV 参数
+                is_keep = (self.keep_aspect_ratio_var.get() == "true")
+                mpv_keepaspect = 'yes' if is_keep else 'no'
+                mpv_aspect_override = '-1' if is_keep else 'no'
+
                 self.mpv_player = mpv.MPV(
                     wid=str(self.video_frame.winfo_id()),
                     keep_open='no',
                     hwdec='auto',
-                    video_aspect_override='-1'
+                    keepaspect=mpv_keepaspect,
+                    video_aspect_override=mpv_aspect_override
                 )
 
                 def _on_ending_file_event(_event):
