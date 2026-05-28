@@ -1,5 +1,20 @@
 # -*- coding: utf-8 -*-
 import ctypes
+try:
+    # 优先尝试启用 Windows 10 推荐的 Per-Monitor (V2) DPI 感知
+    # 如果对应的 shcore.dll 存在且函数可用，则执行该条
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except (AttributeError, OSError):
+    try:
+        # 如果系统版本较低（如未升级的 Win8.1），回退到普通系统级 DPI 感知
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        try:
+            # 如果处于非常古老的 Windows 7 / Vista 环境，调用最初代的全局 DPI 感知
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            # 极端的非 Windows 环境（如 Linux/Mac 测试编译）或彻底损坏的系统底层，执行无痛静默保底
+            pass
 import json
 import logging
 import os
@@ -52,11 +67,6 @@ except ImportError:
     AudioUtilities = None
 
 try:
-    windll.shcore.SetProcessDpiAwareness(1)
-except (AttributeError, OSError):
-    pass
-
-try:
     pygame.mixer.init()
 except pygame.error as pg_err:
     logging.error(f"无法初始化音频设备: {pg_err}")
@@ -65,9 +75,6 @@ except pygame.error as pg_err:
 TARGET_WINDOW_TITLE = 'Mesen - bs'  # 目标模拟器窗口的标题关键字
 SIGNAL_CHECK_INTERVAL = 0.2  # 轮询 Lua 信号文件的时间间隔（秒）
 RETRY_DELAY = 0.05  # 文件读取冲突时的重试延迟
-UI_FONT_BOLD = ("Verdana", 18, "bold")  # 标准粗体 UI 字体
-MONITOR_FONT = ("Verdana", 14, "bold")  # 数据监视区字体
-TRIFORCE_FONT = ("Verdana", 16, "bold")  # 三角力量专用字体
 
 # 日志配置
 logging.basicConfig(
@@ -93,8 +100,8 @@ class BSXSimulator:
         self.root = Tk()
         self.root.title("BS 塞尔达传说 广播终端")
 
-        window_w = int(450 * self.dpi_scale)
-        window_h = int((920 if self.show_debug_ui else 500) * self.dpi_scale)
+        window_w = int(340 * self.dpi_scale)
+        window_h = int((920 if self.show_debug_ui else 420) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
@@ -151,13 +158,29 @@ class BSXSimulator:
         self.root.bind("<<EndingClose>>", lambda e: self._safe_trigger_ending_close())
 
     @staticmethod
-    def _get_system_dpi_scale():
+    def _get_system_dpi_scale(hwnd=None):
+        """ 获取系统实时的 DPI 缩放比例 """
         try:
-            hdc = windll.user32.GetDC(0)
-            dpi = windll.gdi32.DeviceCaps(hdc, 88)
-            windll.user32.ReleaseDC(0, hdc)
+            # 如果传入了具体的窗口句柄，优先获取该窗口当前所在的具体屏幕的实时 DPI
+            if hwnd and hasattr(ctypes.windll.user32, "GetDpiForWindow"):
+                dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+                return dpi / 96.0
+
+            # 现代 Windows 10 / 11 推荐的获取系统总 DPI 的标准 API
+            if hasattr(ctypes.windll.user32, "GetDpiForSystem"):
+                dpi = ctypes.windll.user32.GetDpiForSystem()
+                return dpi / 96.0
+        except Exception as e:
+            logging.warning(f"[DPI获取] 现代API调用失败: {e}，将尝试传统方法保底")
+
+        try:
+            logpixelsx = 88
+            hdc = ctypes.windll.user32.GetDC(0)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, logpixelsx)
+            ctypes.windll.user32.ReleaseDC(0, hdc)
             return dpi / 96.0
-        except (AttributeError, OSError):
+        except Exception as e:
+            logging.warning(f"[DPI获取] 传统方法也失败: {e}，默认返回 1.0")
             return 1.0
 
     @staticmethod
@@ -283,38 +306,48 @@ class BSXSimulator:
         return w, h - offset, point.x, point.y + offset
 
     def _setup_ui(self):
-        dynamic_ui_font = ("Verdana", int(18 * self.dpi_scale), "bold")
-        dynamic_monitor_font = ("Verdana", int(14 * self.dpi_scale), "bold")
-        dynamic_tf_font = ("Verdana", int(16 * self.dpi_scale), "bold")
+        # 1. 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
+        dynamic_ui_font = ("Verdana", -int(26 * self.dpi_scale), "bold")
+        dynamic_monitor_font = ("Verdana", -int(14 * self.dpi_scale), "bold")
+        dynamic_tf_font = ("Verdana", -int(16 * self.dpi_scale), "bold")
 
-        time_frame = Frame(self.root, pady=20)
+        # 2. 界面间距随 DPI 实时调整物理高度
+        pad_5 = int(5 * self.dpi_scale)
+        pad_10 = int(10 * self.dpi_scale)
+        pad_15 = int(15 * self.dpi_scale)
+        pad_20 = int(20 * self.dpi_scale)
+
+        time_frame = Frame(self.root, pady=pad_20)
         time_frame.pack()
         Label(time_frame, text="虚拟卫星时钟", font=dynamic_ui_font).pack(side="left")
-        self.time_display = Label(time_frame, textvariable=self.time_var, font=dynamic_ui_font, fg="#e74c3c", padx=10)
+        self.time_display = Label(time_frame, textvariable=self.time_var, font=dynamic_ui_font, fg="#e74c3c",
+                                  padx=pad_10)
         self.time_display.pack(side="left")
 
+        # wraplength 随 DPI 缩放，去掉高度死值，改用自动换行支撑，防止字变大后被拦腰截断
         self.status_label = Label(self.root, textvariable=self.status_var, fg="#2c3e50",
-                                  wraplength=int(350 * self.dpi_scale), height=3, justify="center")
-        self.status_label.pack(pady=5)
-        self.btn_select = Button(self.root, text="第一步：选择 Mesen.exe", command=self.select_mesen, width=30, height=2)
-        self.btn_select.pack(pady=10)
+                                  wraplength=int(350 * self.dpi_scale), height=2, justify="center")
+        self.status_label.pack(pady=pad_5)
 
-        self.ch_frame = Frame(self.root, pady=5)
+        self.btn_select = Button(self.root, text="第一步：选择 Mesen.exe", command=self.select_mesen, width=30, height=2)
+        self.btn_select.pack(pady=pad_10)
+
+        self.ch_frame = Frame(self.root, pady=pad_5)
         self.ch_frame.pack()
         self.chapter_buttons = []
         for i in range(1, 5):
             btn = Button(self.ch_frame, text=f"第 {i} 周", state="disabled", width=6,
                          command=lambda ch=i: self.prepare_chapter(ch))
-            btn.pack(side="left", padx=5)
+            btn.pack(side="left", padx=pad_5)
             self.chapter_buttons.append(btn)
 
-        self.btn_stop = Button(self.root, text="重置状态", command=self.reset_system, width=30, state="disabled")
-        self.btn_stop.pack(pady=15)
+        self.btn_stop = Button(self.root, text="重置状态", command=self.reset_system, width=30, height=2, state="disabled")
+        self.btn_stop.pack(pady=pad_15)
 
         self.btn_delete_save = Button(self.root, text="删除存档（模拟器关闭状态下使用）", command=self.delete_bios_save,
-                                      width=30,
+                                      width=30, height=2,
                                       state="disabled", fg="#c0392b")
-        self.btn_delete_save.pack(pady=5)
+        self.btn_delete_save.pack(pady=pad_5)
 
         # 画面比例控制勾选框
         self.chk_aspect = Checkbutton(
@@ -325,23 +358,28 @@ class BSXSimulator:
             offvalue="false",
             activebackground=self.root.cget("bg")
         )
-        self.chk_aspect.pack(pady=5)
+        self.chk_aspect.pack(pady=pad_5)
 
+        # 调试监视中心
         if self.show_debug_ui:
-            monitor_section = Frame(self.root, pady=10, padx=20, relief="groove", borderwidth=2)
-            monitor_section.pack(fill="x", padx=20, pady=10)
-            Label(monitor_section, text="[ 结算数据监视中心 ]", font=dynamic_ui_font, fg="#2980b9").pack(pady=(0, 5))
+            monitor_section = Frame(self.root, pady=pad_10, padx=pad_20, relief="groove", borderwidth=2)
+            monitor_section.pack(fill="x", padx=pad_20, pady=pad_10)
+            Label(monitor_section, text="[ 结算数据监视中心 ]", font=dynamic_ui_font, fg="#2980b9").pack(
+                pady=(0, pad_5))
             result_subframe = Frame(monitor_section)
             result_subframe.pack(fill="x")
             Label(result_subframe, textvariable=self.ganon_var, font=dynamic_monitor_font, fg="#e74c3c").pack()
+
+            # 三角力量数据监控自动换行边界物理缩放
             Label(result_subframe, textvariable=self.triforce_var, font=dynamic_tf_font, fg="#f39c12",
                   wraplength=int(300 * self.dpi_scale)).pack()
+
             Label(result_subframe, textvariable=self.death_var, font=dynamic_monitor_font).pack(anchor="w")
             Label(result_subframe, textvariable=self.heart_var, font=dynamic_monitor_font).pack(anchor="w")
             Label(result_subframe, textvariable=self.rupee_var, font=dynamic_monitor_font).pack(anchor="w")
             self.btn_test = Button(monitor_section, text="立即测试数据", command=self.update_settlement_display,
-                                   bg="#ecf0f1")
-            self.btn_test.pack(pady=5, fill="x")
+                                   bg="#ecf0f1", height=1)
+            self.btn_test.pack(pady=pad_5, fill="x")
 
     def select_mesen(self):
         path = filedialog.askopenfilename(title="选择 Mesen.exe", filetypes=[("Mesen", "Mesen.exe")])
@@ -830,6 +868,8 @@ class BSXSimulator:
             try:
                 hwnd = getattr(m, '_hWnd', None)
                 if hwnd:
+                    self.dpi_scale = self._get_system_dpi_scale(hwnd)
+
                     # 1. 声明 Windows 核心位置状态结构体
                     class WINDOWPLACEMENT(ctypes.Structure):
                         _fields_ = [
@@ -861,11 +901,11 @@ class BSXSimulator:
                                 self.overlay.deiconify()  # 恢复可见
                                 logging.info("[同步状态] 检测到模拟器已恢复正常，重新唤醒遮罩覆盖。")
 
-                    # 3. 【高能避坑】无论是否最小化，都必须强制完成真实的像素坐标和高宽计算！
+                    # 3. 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算！
                     # 这样在视频初始化、切换视频瞬间，即使最小化，MPV 也能拿到安全有效的非零几何数据
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
 
-                # 4. 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底，绝对不给内核报错的机会
+                # 4. 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底
                 if cw <= 0 or ch <= 0:
                     cw, ch, cx, cy = 256, 224, 0, 0
 
@@ -975,6 +1015,8 @@ class BSXSimulator:
             try:
                 hwnd = getattr(m, '_hWnd', None)
                 if hwnd:
+                    self.dpi_scale = self._get_system_dpi_scale(hwnd)
+
                     # 1. 获取 Windows 窗口当前的真实显示放置状态
                     class WINDOWPLACEMENT(ctypes.Structure):
                         _fields_ = [
@@ -991,14 +1033,14 @@ class BSXSimulator:
                         if wp.showCmd == 2:  # 2 = SW_SHOWMINIMIZED（最小化状态）
                             is_minimized = True
 
-                    # 2. 如果顽皮玩家在结算界面又最小化了模拟器
+                    # 2. 如果玩家在结算界面又最小化了模拟器
                     if is_minimized:
                         if not self._overlay_minimized_by_mesen:
                             self._overlay_minimized_by_mesen = True
                             self.overlay.withdraw()  # 随动隐形，保证桌面不穿帮
                             logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
 
-                        # 【核心防御】拦截住！千万不要去执行后续错误的 0x0 图形刷新，静默等待复原
+                        # 核心拦截！不要去执行后续错误的 0x0 图形刷新，静默等待复原
                         self.root.after(30, self._settlement_sync_loop)
                         return
 
@@ -1032,9 +1074,9 @@ class BSXSimulator:
             self.close_overlay()
             return
 
-        # 维持高频同步（将 100ms 提速至 30ms 带来商业级丝滑跟踪感，你也可以改成 100）
+        # 维持高频同步
         if self.settlement_active and self.overlay and self.overlay.winfo_exists():
-            self.root.after(30, self._settlement_sync_loop)
+            self.root.after(100, self._settlement_sync_loop)
 
     def show_custom_settlement_box(self):
         if self.settlement_active:
@@ -1079,7 +1121,8 @@ class BSXSimulator:
 
         hwnd = getattr(m, '_hWnd', None)
         if hwnd:
-            # === 【完美切入点】在这里拦截并强行恢复最小化的模拟器 ===
+            self.dpi_scale = self._get_system_dpi_scale(hwnd)
+            # 在这里拦截并强行恢复最小化的模拟器
             try:
                 # 向 Windows 查询当前模拟器的放置状态
                 class WINDOWPLACEMENT(ctypes.Structure):
@@ -1103,7 +1146,7 @@ class BSXSimulator:
                         ctypes.windll.user32.SetForegroundWindow(hwnd)
                         logging.info("[结算唤醒] 检测到模拟器处于最小化，已成功恢复并强抬至前台。")
 
-                        # 【时序补丁】强抬可能需要微小的系统级刷新时间，让 Win32 响应后再读取最新位置
+                        # 强抬可能需要微小的系统级刷新时间，让 Win32 响应后再读取最新位置
                         time.sleep(0.05)
             except Exception as e:
                 logging.debug(f"[结算唤醒异常] {e}")
@@ -1143,16 +1186,13 @@ class BSXSimulator:
                 self.bg_image_ref = ImageTk.PhotoImage(bg_img)
                 self.canvas.create_image(0, 0, anchor="nw", image=self.bg_image_ref)
 
-            # 所有作用于 Canvas 内部的数值均除以缩放比
-            scale = self.dpi_scale
+            # 基础字号转换：直接随模拟器窗口高度等比缩放
+            f_size = -max(12, int(ch * 0.055))
+            tf_size_val = int(cw * 0.055)
 
-            # 基础字号转换（转换为逻辑字号避免 Tkinter 二次放大）
-            f_size = max(9, int((ch * 0.045) / scale))
-            tf_size_val = int((cw * 0.055) / scale)
-
-            # 逻辑坐标计算
-            logical_cw = cw / scale
-            logical_ch = ch / scale
+            # 布局边界直接采用物理边界，保证缩放百分比随动
+            logical_cw = cw
+            logical_ch = ch
 
             self.canvas.create_text(logical_cw / 2, logical_ch * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
                                     font=("Verdana", f_size))
@@ -1174,7 +1214,7 @@ class BSXSimulator:
 
             tf_bits = [int(b) for b in bin(tf_val)[2:].zfill(8)]
             for i, bit in enumerate(tf_bits):
-                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int((cw * 0.01) / scale)))
+                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int(cw * 0.01)))
                 if bit == 1 and self.triforce_frames:
                     img_id = self.canvas.create_image(cur_x, curr_y, image=self.triforce_frames[0], anchor="center")
                     self._animate_triforce(img_id, 0)
@@ -1243,7 +1283,7 @@ class BSXSimulator:
         try:
             triggered = False
 
-            # === 1. 跨进程全局键盘盲听（键盘） ===
+            # 1. 跨进程全局键盘盲听（键盘）
             for vk_code in range(8, 256):
                 if vk_code in (1, 2):  # 过滤鼠标左右键点击
                     continue
@@ -1252,7 +1292,7 @@ class BSXSimulator:
                     triggered = True
                     break
 
-            # === 2. XInput 全局手柄检测（手柄） ===
+            # 2. XInput 全局手柄检测（手柄）
             if not triggered:
                 # 声明 XInput 手柄状态结构体类型
                 class XinputButtons(ctypes.Structure):
