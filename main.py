@@ -662,23 +662,10 @@ class BSXSimulator:
 
     def play_story_video(self, video_name):
         """ 视频投影逻辑：在模拟器上方建立透明遮罩并调用 mpv 播放 """
-
-        # 1. 异步毁灭状态机检查
+        # 如果底层仍在进行异步毁灭，利用 after 50ms 后重新检查
         if getattr(self, '_mpv_destroying', False):
-            logging.warning(f"[播放管道] 检测到旧 MPV 仍在后台销毁，延时 50ms 后重新尝试: {video_name}")
-
-            # 只需要让父级容器背景变黑，如果有残留的 Canvas 也一并清空
-            if self.overlay and self.overlay.winfo_exists():
-                self.overlay.configure(bg="black")
-                if self.canvas:
-                    try:
-                        self.canvas.delete("all")
-                        self.canvas.pack_forget()
-                    except TclError:
-                        pass
-                self.overlay.update()  # 强制渲染这块黑布
-
-            # 安全挂起 50ms 后重试
+            logging.warning(f"[播放管道] 检测到旧 MPV 仍在后台销毁，延时 50ms 后重新尝试拉起视频: {video_name}")
+            # 确保 50ms 后正确重试
             self.root.after(50, lambda: self.play_story_video(video_name))
             return
 
