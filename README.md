@@ -20,8 +20,8 @@
     * [Mesen 模拟器](https://www.mesen.ca/) 。
 * **汉化资源包或懒人整合包**：
     * 已统一放置在演示视频的简介与置顶评论区，请移步获取：
-    *  [📺 点击前往 AcFun 视频发布页获取资源包](https://www.acfun.cn/u/13400653)
-    *  [🌐 点击前往 Youtube 视频发布页获取资源包](https://www.youtube.com/@gamecafe0430)
+    *  [📺 点击前往 AcFun 视频发布页获取资源包](https://www.acfun.cn/v/ac48565019)
+    *  [🌐 点击前往 Youtube 视频发布页获取资源包](https://www.youtube.com/watch?v=H36nNy0GOjs)
 * **核心BIOS**：
     * 请自行准备日文的 BS-X BIOS 固件，例如 `BS-X BIOS (Japan) [No DRM].sfc` 。
 
