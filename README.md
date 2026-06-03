@@ -1,4 +1,4 @@
-# BS 塞尔达传说 广播推送终端 (BS-Zelda-Satellaview-Terminal)
+# BS 塞尔达传说 广播推送终端
 
 本项目是一个为 **汉化版 BS 塞尔达传说 (BS Zelda no Densetsu)** 设计的第三方辅助工具。它旨在模拟 1995 年原版 Satellaview 的实时同步广播音频流。并且通过 Python 与 Mesen 模拟器联动，还原当年的剧情播放与成绩结算系统。
 
