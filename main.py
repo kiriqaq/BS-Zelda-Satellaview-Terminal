@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import ctypes
+
 try:
     # 优先尝试启用 Windows 10 推荐的 Per-Monitor (V2) DPI 感知
     # 如果对应的 shcore.dll 存在且函数可用，则执行该条
@@ -89,30 +90,41 @@ logging.basicConfig(
 class BSXSimulator:
     """
     BS 塞尔达广播模拟终端主类
-    负责：模拟时钟、视频遮罩投影、音频同步、结算数据渲染
     """
 
+    # 定义 Windows 窗口位置结构体
+    class _WINDOWPLACEMENT(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_uint),
+            ("flags", ctypes.c_uint),
+            ("showCmd", ctypes.c_uint),
+            ("ptMinPosition", ctypes.c_long * 2),
+            ("ptMaxPosition", ctypes.c_long * 2),
+            ("rcNormalPosition", ctypes.c_long * 4)
+        ]
+
     def __init__(self):
-        # 1. 初始化系统环境
+        # 初始化系统环境
         self.dpi_scale = self._get_system_dpi_scale()
         self.show_debug_ui = False
 
         self.root = Tk()
-        self.root.title("BS 塞尔达传说 广播终端")
+        self.root.title("Satellaview Terminal 1.3.0")
 
         window_w = int(340 * self.dpi_scale)
-        window_h = int((920 if self.show_debug_ui else 420) * self.dpi_scale)
+        window_h = int((950 if self.show_debug_ui else 450) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
-        # 2. 初始化路径变量
+        # 初始化路径变量
         self.mesen_path = ""
         self.mesen_dir = ""
         self.lua_data_dir = ""
         self.bs_sfc_path = ""
 
-        # 3. 初始化状态控制变量
+        # 初始化状态控制变量
         self.selected_chapter = None
+        self.selected_mode = None
         self.timer_running = False
         self.has_triggered_1800 = False
         self._target_window = None
@@ -121,7 +133,7 @@ class BSXSimulator:
         self._audio_lock = threading.Lock()
         self._mpv_destroying = False
 
-        # 4. 视频遮罩与 UI 引用容器
+        # 视频遮罩与 UI 引用容器
         self.overlay = None
         self.canvas = None
         self.video_frame = None
@@ -130,18 +142,19 @@ class BSXSimulator:
         self.triforce_frames = []
         self.ui_refs = []
 
-        # 5. 播放状态标志
+        # 播放状态标志
         self.settlement_active = False
         self.is_ending_mode = False
         self.is_waiting_video_mode = False
         self.is_ganon_room_active = False
         self.ganon_mute_timer = None
         self.settlement_audio_locked = False
+        self._settlement_sync_active = False
         self._last_geo = ""
 
-        # 6. 绑定 UI 数据变量
+        # 绑定 UI 数据变量
         self.time_var = StringVar(value="17:59:00")
-        self.status_var = StringVar(value="系统就绪：请选择主程序 Mesen.exe")
+        self.status_var = StringVar(value="请定位模拟器的主程序 Mesen.exe ")
         self.death_var = StringVar(value="重新开始的次数: -- 次")
         self.heart_var = StringVar(value="损失的心心数量: -- 个")
         self.rupee_var = StringVar(value="所持的卢比数量: -- 卢比")
@@ -203,7 +216,7 @@ class BSXSimulator:
             return False
 
         with self._audio_lock:  # 强行加锁，保证同一时间只有一个线程能操作 pycaw
-            # 1. 检查缓存，同时必须验证这个进程是不是还在正常运行
+            # 检查缓存，同时必须验证这个进程是不是还在正常运行
             if self._mesen_audio_session:
                 try:
                     # 通过直接获取常驻进程状态探活
@@ -230,6 +243,34 @@ class BSXSimulator:
                 logging.error(f"音量控制或捕获失败: {e}")
             return False
 
+    @staticmethod
+    def _play_audio(path, volume=1.0, loop=False):
+        """安全播放音频的封装方法"""
+        if not os.path.exists(path):
+            logging.warning(f"[音频] 文件不存在: {path}")
+            return False
+        try:
+            pygame.mixer.music.set_volume(max(0.0, min(1.0, volume)))
+            pygame.mixer.music.load(path)
+            loops = -1 if loop else 0
+            pygame.mixer.music.play(loops=loops)
+            logging.info(f"[音频] 开始播放: {os.path.basename(path)}" + (" (循环)" if loop else ""))
+            return True
+        except Exception as e:
+            logging.error(f"[音频] 播放失败 {os.path.basename(path)}: {e}")
+            return False
+
+    @staticmethod
+    def _stop_audio():
+        """安全停止并卸载音频"""
+        try:
+            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
+                pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+            logging.info("[音频] 已停止并卸载当前音频")
+        except Exception as e:
+            logging.warning(f"[音频] 停止时出现异常: {e}")
+
     def _patch_mesen_settings(self):
         settings_path = os.path.join(self.mesen_dir, "settings.json")
         if not os.path.exists(settings_path):
@@ -240,25 +281,29 @@ class BSXSimulator:
             with open(settings_path, 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
 
-            # 1. 开启 Lua 脚本系统 IO/OS 访问权限
+            # 开启 Lua 脚本系统 IO/OS 访问权限
             if "Debug" in config and "ScriptWindow" in config["Debug"]:
                 config["Debug"]["ScriptWindow"]["AllowIoOsAccess"] = True
                 logging.info("[配置] 成功开启脚本 IO/OS 访问权限")
 
-            # 2. 修改 BSX 卫星时钟底座时间
+            # 修改 BSX 卫星时钟时间
             if "Snes" in config:
                 config["Snes"]["BsxUseCustomTime"] = True
                 config["Snes"]["BsxCustomTime"] = "09:59:00"
                 logging.info("[配置] 成功修改 Bsx 时间")
 
-            # 3. 清除手柄快进/快退快捷键绑定
+            # 清除会影响时间轴的快捷键绑定
             if "Preferences" in config and "ShortcutKeys" in config["Preferences"]:
                 shortcut_keys_list = config["Preferences"]["ShortcutKeys"]
                 if isinstance(shortcut_keys_list, list):
                     modified_shortcuts = 0
                     for shortcut_item in shortcut_keys_list:
-                        # 匹配快进或快退项
-                        if shortcut_item.get("Shortcut") in ["FastForward", "Rewind"]:
+                        # 匹配项
+                        if shortcut_item.get("Shortcut") in ["FastForward", "Rewind", "IncreaseSpeed", "DecreaseSpeed",
+                                                             "MaxSpeed", "Pause", "RunSingleFrame"]:
+                            if "KeyCombination" in shortcut_item:
+                                shortcut_item["KeyCombination"]["Key1"] = 0
+                                modified_shortcuts += 1
                             if "KeyCombination2" in shortcut_item:
                                 shortcut_item["KeyCombination2"]["Key1"] = 0
                                 modified_shortcuts += 1
@@ -298,26 +343,26 @@ class BSXSimulator:
     def _get_client_geometry(self, hwnd):
         rect = wintypes.RECT()
         windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
+        w = rect.right - rect.left  # noqa
+        h = rect.bottom - rect.top  # noqa
         point = wintypes.POINT(0, 0)
         windll.user32.ClientToScreen(hwnd, ctypes.byref(point))
         offset = int(25 * self.dpi_scale)
-        return w, h - offset, point.x, point.y + offset
+        return w, h - offset, point.x, point.y + offset  # noqa
 
     def _setup_ui(self):
-        # 1. 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
+        # 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
         dynamic_ui_font = ("Verdana", -int(26 * self.dpi_scale), "bold")
         dynamic_monitor_font = ("Verdana", -int(14 * self.dpi_scale), "bold")
         dynamic_tf_font = ("Verdana", -int(16 * self.dpi_scale), "bold")
 
-        # 2. 界面间距随 DPI 实时调整物理高度
+        # 界面间距随 DPI 实时调整物理高度
         pad_5 = int(5 * self.dpi_scale)
         pad_10 = int(10 * self.dpi_scale)
-        pad_15 = int(15 * self.dpi_scale)
+        # pad_15 = int(15 * self.dpi_scale)
         pad_20 = int(20 * self.dpi_scale)
 
-        time_frame = Frame(self.root, pady=pad_20)
+        time_frame = Frame(self.root, pady=pad_10)
         time_frame.pack()
         Label(time_frame, text="虚拟卫星时钟", font=dynamic_ui_font).pack(side="left")
         self.time_display = Label(time_frame, textvariable=self.time_var, font=dynamic_ui_font, fg="#e74c3c",
@@ -325,40 +370,53 @@ class BSXSimulator:
         self.time_display.pack(side="left")
 
         # wraplength 随 DPI 缩放，去掉高度死值，改用自动换行支撑，防止字变大后被拦腰截断
-        self.status_label = Label(self.root, textvariable=self.status_var, fg="#2c3e50",
+        self.status_label = Label(self.root, textvariable=self.status_var, font=dynamic_tf_font, fg="#c0392b",
                                   wraplength=int(350 * self.dpi_scale), height=2, justify="center")
-        self.status_label.pack(pady=pad_5)
+        self.status_label.pack(pady=pad_10)
 
-        self.btn_select = Button(self.root, text="第一步：选择 Mesen.exe", command=self.select_mesen, width=30, height=2)
-        self.btn_select.pack(pady=pad_10)
+        # 模式选择框架（表模式 / 里模式）
+        self.mode_frame = Frame(self.root, pady=pad_10)
+        self.mode_frame.pack()
 
-        self.ch_frame = Frame(self.root, pady=pad_5)
+        self.btn_mode_m1 = Button(self.mode_frame, text="表模式", width=10, height=2, state="disabled",  # 改为 disabled
+                                  command=lambda: self.select_mode("m1"))
+        self.btn_mode_m1.pack(side="left", padx=pad_10)
+
+        self.btn_mode_m2 = Button(self.mode_frame, text="里模式", width=10, height=2, state="disabled",  # 改为 disabled
+                                  command=lambda: self.select_mode("m2"))
+        self.btn_mode_m2.pack(side="left", padx=pad_10)
+
+        self.ch_frame = Frame(self.root, pady=pad_10)
         self.ch_frame.pack()
         self.chapter_buttons = []
         for i in range(1, 5):
             btn = Button(self.ch_frame, text=f"第 {i} 周", state="disabled", width=6,
                          command=lambda ch=i: self.prepare_chapter(ch))
-            btn.pack(side="left", padx=pad_5)
+            btn.pack(side="left", padx=pad_10)
             self.chapter_buttons.append(btn)
 
-        self.btn_stop = Button(self.root, text="重置状态", command=self.reset_system, width=30, height=2, state="disabled")
-        self.btn_stop.pack(pady=pad_15)
+        self.btn_select = Button(self.root, text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen, width=35, height=2)
+        self.btn_select.pack(pady=pad_20)
 
-        self.btn_delete_save = Button(self.root, text="删除存档（模拟器关闭状态下使用）", command=self.delete_bios_save,
-                                      width=30, height=2,
+        self.btn_stop = Button(self.root, text="重置状态（选择其他周）", command=self.reset_system, width=35, height=1,
+                               state="disabled")
+        self.btn_stop.pack(pady=pad_5)
+
+        self.btn_delete_save = Button(self.root, text="删除存档（需要关闭模拟器后使用）", command=self.delete_bios_save,
+                                      width=35, height=1,
                                       state="disabled", fg="#c0392b")
         self.btn_delete_save.pack(pady=pad_5)
 
         # 画面比例控制勾选框
         self.chk_aspect = Checkbutton(
             self.root,
-            text="保持画面比例（防止拉伸变形）",
+            text="勾选保持画面比例（防止拉伸变形）",
             variable=self.keep_aspect_ratio_var,
             onvalue="true",
             offvalue="false",
             activebackground=self.root.cget("bg")
         )
-        self.chk_aspect.pack(pady=pad_5)
+        self.chk_aspect.pack(pady=pad_10)
 
         # 调试监视中心
         if self.show_debug_ui:
@@ -382,7 +440,7 @@ class BSXSimulator:
             self.btn_test.pack(pady=pad_5, fill="x")
 
     def select_mesen(self):
-        path = filedialog.askopenfilename(title="选择 Mesen.exe", filetypes=[("Mesen", "Mesen.exe")])
+        path = filedialog.askopenfilename(title="请选择模拟器根目录的 Mesen.exe ", filetypes=[("Mesen", "Mesen.exe")])
         if path:
             self.mesen_path = path
             self.mesen_dir = os.path.dirname(path)
@@ -393,6 +451,12 @@ class BSXSimulator:
             if not os.path.exists(self.bs_sfc_path):
                 self._handle_missing_bios()
             else:
+                # BIOS 存在，启用模式按钮
+                self.btn_mode_m1.config(state="normal")
+                self.btn_mode_m2.config(state="normal")
+                # 修改主按钮为"第二步：请选择表/里模式"
+                self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal",
+                                       command=self.activate_mode_selection)
                 self._activate_chapter_selection()
 
     def delete_bios_save(self):
@@ -413,7 +477,7 @@ class BSXSimulator:
                 messagebox.showinfo("提示", "未找到存档文件，无需删除。")
 
     def _handle_missing_bios(self):
-        messagebox.showinfo("核心文件检查", "未检测到 BS-X BIOS，请手动选择。")
+        messagebox.showinfo("BS-X BIOS 检查", "未检测到 BS-X BIOS，请手动选择 BIOS 文件。")
         bios_file = filedialog.askopenfilename(
             title="请选择 BS-X BIOS",
             filetypes=[("BS-X BIOS / SFC ROM", "*.sfc *.smc *.bin"), ("所有文件", "*.*")]
@@ -422,22 +486,74 @@ class BSXSimulator:
             try:
                 os.makedirs(os.path.dirname(self.bs_sfc_path), exist_ok=True)
                 shutil.copy2(bios_file, self.bs_sfc_path)
+                # BIOS 复制成功后，启用模式按钮
+                self.btn_mode_m1.config(state="normal")
+                self.btn_mode_m2.config(state="normal")
+                # 修改主按钮为"第二步：请选择表/里模式"
+                self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal",
+                                       command=self.activate_mode_selection)
                 self._activate_chapter_selection()
             except (shutil.Error, OSError) as err:
                 messagebox.showerror("错误", f"无法复制 BIOS: {err}")
         else:
-            self.status_var.set("配置未完成。")
+            self.status_var.set("错误：BS-X BIOS 配置未完成")
 
     def _activate_chapter_selection(self):
-        self.status_var.set("系统就绪：请选择第几周的任务。")
-        self.btn_select.config(text="第二步：请选择第几周...", state="disabled")
+        self.status_var.set("请选择需要推送的版本")
+        self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal", command=self.activate_mode_selection)
+
+    def activate_mode_selection(self):
+        """第二步：提示用户选择表模式或里模式"""
+        self.status_var.set("请点击下方 表模式 / 里模式 按钮进行选择")
+        # 闪烁提示或者只是更新状态栏
+        logging.info("[UI提示] 请选择表模式或里模式")
+
+    def select_mode(self, mode):
+        """选择表模式或里模式"""
+        self.selected_mode = mode
+        mode_name = "表模式" if mode == "m1" else "里模式"
+
+        # 更新状态栏提示
+        self.status_var.set(f"已选择：{mode_name}\n请选择推送 第几周 的广播")
+
+        # 修改主按钮为"第三步：请选择第几周"
+        self.btn_select.config(text="第 3 步：选择 第几周 ", command=self.activate_chapter_selection)
+
+        # 启用章节按钮
         for btn in self.chapter_buttons:
             btn.config(state="normal")
 
+        # 模式选择按钮变为不可选
+        self.btn_mode_m1.config(state="disabled")
+        self.btn_mode_m2.config(state="disabled")
+
+        logging.info(f"[模式选择] 用户选择了 {mode_name}")
+
+    def activate_chapter_selection(self):
+        """第三步：提示用户选择第几周"""
+        self.status_var.set("请点击下方 第 X 周 按钮选择")
+        logging.info("[UI提示] 请选择第几周")
+
     def prepare_chapter(self, ch):
+        if self.selected_mode is None:
+            self.status_var.set("请选择需要推送的版本")
+            return
         self.selected_chapter = ch
-        self.status_var.set(f"已锁定：第 {ch} 周\n倒计时准备就绪。")
-        self.btn_select.config(text="第三步：点击后1分钟进行广播推送", command=self.start_countdown, state="normal")
+        mode_name = "表模式" if self.selected_mode == "m1" else "里模式"
+        self.status_var.set(f"已锁定：{mode_name} 第 {ch} 周\n倒计时准备就绪")
+
+        # 修改按钮为"第四步：点击后1分钟进行广播推送"
+        self.btn_select.config(text="第 4 步：点击开始，将在1分钟后推送广播", command=self.start_countdown)
+
+        # 章节按钮变为不可选
+        for btn in self.chapter_buttons:
+            btn.config(state="disabled")
+
+        logging.info(f"[章节选择] 用户选择了第 {ch} 周")
+
+    def _is_bios_ready(self):
+        """检查 BIOS 是否已就绪"""
+        return self.mesen_dir is not None and os.path.exists(self.bs_sfc_path)
 
     def reset_system(self):
         logging.info("[系统指令] 用户点击了重置系统按钮...")
@@ -445,11 +561,10 @@ class BSXSimulator:
         self._target_window = None
         self.settlement_audio_locked = False
         self.close_overlay()
+        self._stop_audio()
         try:
             if pygame.mixer.get_init():
-                pygame.mixer.music.set_volume(1.0)
-                pygame.mixer.music.stop()
-                pygame.mixer.music.unload()
+                pass
         except Exception as pg_reset_err:
             logging.warning(f"[音频重建] 重置系统时发现音频设备故障，正在尝试热重载音频层: {pg_reset_err}")
             try:
@@ -457,6 +572,7 @@ class BSXSimulator:
                 pygame.mixer.init()
             except pygame.error:
                 pass
+
         if self.ganon_mute_timer:
             try:
                 self.root.after_cancel(self.ganon_mute_timer)
@@ -468,37 +584,74 @@ class BSXSimulator:
         self.time_var.set("17:59:00")
         self.has_triggered_1800 = False
         self.is_ending_mode = False
+        self.selected_chapter = None
+        self.selected_mode = None
         self.btn_stop.config(state="disabled")
-        self._activate_chapter_selection()
+
+        # 重置模式选择 UI
+        # 根据当前 Mesen 和 BIOS 状态决定恢复到哪一步
+        if self.mesen_dir and self._is_bios_ready():
+            # Mesen 已选且 BIOS 存在，恢复到第二步（选择模式）
+            self.btn_mode_m1.config(state="normal")
+            self.btn_mode_m2.config(state="normal")
+            self.btn_select.config(state="normal", text="第 2 步：选择 表模式 / 里模式 ", command=self.activate_mode_selection)
+            self.status_var.set("请选择需要推送的版本")
+        elif self.mesen_dir:
+            # Mesen 已选但 BIOS 不存在，恢复到第一步（需要选择 BIOS）
+            self.btn_mode_m1.config(state="disabled")
+            self.btn_mode_m2.config(state="disabled")
+            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen)
+            self.status_var.set("请定位模拟器的主程序 Mesen.exe ")
+        else:
+            # 没有任何配置，恢复到初始状态
+            self.btn_mode_m1.config(state="disabled")
+            self.btn_mode_m2.config(state="disabled")
+            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen)
+            self.status_var.set("请定位模拟器的主程序 Mesen.exe ")
+
+        # 章节按钮全部禁用（等待模式选择后再启用）
+        for btn in self.chapter_buttons:
+            btn.config(state="disabled")
+
         self.chk_aspect.config(state="normal")
         logging.info("[系统指令] 系统复位完毕。")
+
+    @staticmethod
+    def _retry_file_operation(operation, path, content=None, retries=3):
+        """
+        带重试机制的文件操作辅助函数
+        operation: 'read' 或 'write'
+        """
+        for attempt in range(retries):
+            try:
+                if operation == 'read':
+                    with open(path, "r", encoding="utf-8") as f:
+                        return f.read().strip()
+                elif operation == 'write':
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    return True
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                if attempt == retries - 1:  # 最后一次失败才记录日志
+                    logging.error(f"[文件操作] {operation} {path} 失败: {e}")
+                time.sleep(RETRY_DELAY)
+        return None if operation == 'read' else False
 
     def read_lua_file(self, filename, retries=2):
         if not self.lua_data_dir:
             return None
         path = os.path.join(self.lua_data_dir, filename)
-        for _ in range(retries):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return f.read().strip()
-            except (FileNotFoundError, PermissionError, OSError):
-                time.sleep(RETRY_DELAY)
-        return None
+        return self._retry_file_operation('read', path, retries=retries)
 
     def write_lua_file(self, filename, content, retries=3):
         """带有冲突重试机制的安全 Lua 文件写入"""
         if not self.lua_data_dir:
             return False
         path = os.path.join(self.lua_data_dir, filename)
-        for _ in range(retries):
-            try:
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                return True
-            except (PermissionError, OSError):
-                time.sleep(RETRY_DELAY)
-        logging.error(f"[信号写入] 尝试重写 {filename} 失败，文件可能被系统或模拟器独占")
-        return False
+        result = self._retry_file_operation('write', path, content=content, retries=retries)
+        if not result:
+            logging.error(f"[信号写入] 尝试重写 {filename} 失败，文件可能被系统或模拟器独占")
+        return result
 
     def update_settlement_display(self):
         content = self.read_lua_file("result_data.txt")
@@ -526,22 +679,49 @@ class BSXSimulator:
 
     def start_countdown(self):
         if not self.timer_running:
-            self.timer_running = True
+            if self.selected_mode is None:
+                logging.error("[启动失败] 未选择游戏模式")
+                self.status_var.set("请先选择模式（表模式/里模式）")
+                self.reset_system()
+                return
+            if self.selected_chapter is None:
+                logging.error("[启动失败] 未选择章节")
+                self.status_var.set("请先选择第几周")
+                self.reset_system()
+                return
+
+            # 禁用主按钮，防止重复点击
             self.btn_select.config(state="disabled")
+
+            # 确保模式按钮被禁用
+            self.btn_mode_m1.config(state="disabled")
+            self.btn_mode_m2.config(state="disabled")
+
+            self.timer_running = True
             self.btn_stop.config(state="normal")
             for btn in self.chapter_buttons:
                 btn.config(state="disabled")
             self.chk_aspect.config(state="disabled")
 
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-            reset_dir = os.path.join(self.mesen_dir, "bszelda", "0")
+            reset_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, "0")
+            logging.info(f"[广播数据] 源路径: {reset_dir}")
+            logging.info(f"[广播数据] 目标路径: {sat_dir}")
+
             if os.path.exists(reset_dir):
+                logging.info(f"[广播数据] 源文件夹存在，开始复制...")
                 os.makedirs(sat_dir, exist_ok=True)
+                files_copied = 0
                 for item in os.listdir(reset_dir):
                     try:
                         shutil.copy2(os.path.join(reset_dir, item), os.path.join(sat_dir, item))
+                        files_copied += 1
                     except (shutil.Error, OSError) as e:
                         logging.error(f"[复位失败] 无法拷贝初始文件 {item}: {e}")
+                logging.info(f"[广播数据] 复制完成，共复制 {files_copied} 个文件")
+            else:
+                logging.error(f"[广播数据] 源文件夹不存在: {reset_dir}")
+
             bs_rom = self.bs_sfc_path
             bs_lua = os.path.join("bs.lua")
             try:
@@ -574,13 +754,7 @@ class BSXSimulator:
 
         audio_path = os.path.join(self.mesen_dir, "bszelda", "wav", f"ED{final_ch}.wav")
         if os.path.exists(audio_path):
-            try:
-                pygame.mixer.music.set_volume(1.0)
-                pygame.mixer.music.load(audio_path)
-                pygame.mixer.music.play()
-                logging.info(f"[结局音频] 成功播放: {os.path.basename(audio_path)}")
-            except Exception as e:
-                logging.error(f"播放音频失败: {e}")
+            self._play_audio(audio_path, volume=1.0)
         else:
             logging.warning(f"[结局音频] 未找到文件 {os.path.basename(audio_path)}，将保持静音。")
 
@@ -870,16 +1044,9 @@ class BSXSimulator:
                 if hwnd:
                     self.dpi_scale = self._get_system_dpi_scale(hwnd)
 
-                    # 1. 声明 Windows 核心位置状态结构体
-                    class WINDOWPLACEMENT(ctypes.Structure):
-                        _fields_ = [
-                            ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
-                            ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
-                            ("rcNormalPosition", ctypes.c_long * 4)  # 包含正常状态下的 [left, top, right, bottom]
-                        ]
-
-                    wp = WINDOWPLACEMENT()
-                    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+                    # 声明 Windows 核心位置状态结构体
+                    wp = self._WINDOWPLACEMENT()
+                    wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
 
                     is_minimized = False
                     if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
@@ -887,7 +1054,7 @@ class BSXSimulator:
                         if wp.showCmd == 2:
                             is_minimized = True
 
-                    # 2. 状态平滑流转逻辑
+                    # 状态平滑流转逻辑
                     if is_minimized:
                         if not self._overlay_minimized_by_mesen:
                             self._overlay_minimized_by_mesen = True
@@ -901,11 +1068,11 @@ class BSXSimulator:
                                 self.overlay.deiconify()  # 恢复可见
                                 logging.info("[同步状态] 检测到模拟器已恢复正常，重新唤醒遮罩覆盖。")
 
-                    # 3. 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算！
+                    # 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算
                     # 这样在视频初始化、切换视频瞬间，即使最小化，MPV 也能拿到安全有效的非零几何数据
                     cw, ch, cx, cy = self._get_client_geometry(hwnd)
 
-                # 4. 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底
+                # 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底
                 if cw <= 0 or ch <= 0:
                     cw, ch, cx, cy = 256, 224, 0, 0
 
@@ -944,9 +1111,9 @@ class BSXSimulator:
         # 主线程继续往下走，立刻恢复模拟器的音量
         self._set_mesen_mute(False)
 
-        if self.is_ending_mode and self.mesen_dir:
+        if self.is_ending_mode and self.mesen_dir and self.selected_mode:
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-            reset_dir = os.path.join(self.mesen_dir, "bszelda", "0")
+            reset_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, "0")
             if os.path.exists(reset_dir):
                 os.makedirs(sat_dir, exist_ok=True)
                 for item in os.listdir(reset_dir):
@@ -987,7 +1154,7 @@ class BSXSimulator:
 
     def trigger_broadcast_and_audio(self):
         sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-        ch_dir = os.path.join(self.mesen_dir, "bszelda", str(self.selected_chapter))
+        ch_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, str(self.selected_chapter))
         if os.path.exists(ch_dir):
             os.makedirs(sat_dir, exist_ok=True)
             for item in os.listdir(ch_dir):
@@ -996,85 +1163,81 @@ class BSXSimulator:
                 except (shutil.Error, OSError):
                     continue
 
+        # 音频文件路径不变（共用）
         audio_path = os.path.join(self.mesen_dir, "bszelda", "wav", f"{self.selected_chapter}.wav")
-        if os.path.exists(audio_path):
-            try:
-                pygame.mixer.music.load(audio_path)
-                pygame.mixer.music.play()
-                logging.info(f"[广播音频] 正在播放主流程广播配音: {os.path.basename(audio_path)}")
-            except Exception as e:
-                logging.error(f"广播音频播放失败: {e}")
+        self._play_audio(audio_path, volume=1.0)
 
     def _settlement_sync_loop(self):
         """ 针对结算界面的超高精度同步时钟：完美防范玩家在成绩单界面反复最小化/恢复 """
-        if not self.settlement_active or not self.overlay or not self.overlay.winfo_exists():
+        # 防止重复注册
+        if self._settlement_sync_active:
             return
+        self._settlement_sync_active = True
 
-        m = self._get_mesen_window()
-        if m:
-            try:
-                hwnd = getattr(m, '_hWnd', None)
-                if hwnd:
-                    self.dpi_scale = self._get_system_dpi_scale(hwnd)
+        try:
+            if not self.settlement_active or not self.overlay or not self.overlay.winfo_exists():
+                return
 
-                    # 1. 获取 Windows 窗口当前的真实显示放置状态
-                    class WINDOWPLACEMENT(ctypes.Structure):
-                        _fields_ = [
-                            ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
-                            ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
-                            ("rcNormalPosition", ctypes.c_long * 4)
-                        ]
+            m = self._get_mesen_window()
+            if m:
+                try:
+                    hwnd = getattr(m, '_hWnd', None)
+                    if hwnd:
+                        self.dpi_scale = self._get_system_dpi_scale(hwnd)
 
-                    wp = WINDOWPLACEMENT()
-                    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+                        # 获取 Windows 窗口当前的真实显示放置状态
+                        wp = self._WINDOWPLACEMENT()
+                        wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
 
-                    is_minimized = False
-                    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-                        if wp.showCmd == 2:  # 2 = SW_SHOWMINIMIZED（最小化状态）
-                            is_minimized = True
+                        is_minimized = False
+                        if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+                            if wp.showCmd == 2:  # 2 = SW_SHOWMINIMIZED（最小化状态）
+                                is_minimized = True
 
-                    # 2. 如果玩家在结算界面又最小化了模拟器
-                    if is_minimized:
-                        if not self._overlay_minimized_by_mesen:
-                            self._overlay_minimized_by_mesen = True
-                            self.overlay.withdraw()  # 随动隐形，保证桌面不穿帮
-                            logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
+                        # 如果玩家在结算界面又最小化了模拟器
+                        if is_minimized:
+                            if not self._overlay_minimized_by_mesen:
+                                self._overlay_minimized_by_mesen = True
+                                self.overlay.withdraw()  # 随动隐形，保证桌面不穿帮
+                                logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
 
-                        # 核心拦截！不要去执行后续错误的 0x0 图形刷新，静默等待复原
-                        self.root.after(30, self._settlement_sync_loop)
-                        return
+                            # 核心拦截！不要去执行后续错误的 0x0 图形刷新，静默等待复原
+                            self.root.after(30, self._settlement_sync_loop)
+                            return
 
-                    # 3. 如果玩家又把模拟器从任务栏里点开了（恢复正常）
-                    else:
-                        if self._overlay_minimized_by_mesen:
-                            self._overlay_minimized_by_mesen = False
-                            self.overlay.deiconify()  # 随动恢复可见
-                            logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
+                        # 如果玩家又把模拟器从任务栏里点开了（恢复正常）
+                        else:
+                            if self._overlay_minimized_by_mesen:
+                                self._overlay_minimized_by_mesen = False
+                                self.overlay.deiconify()  # 随动恢复可见
+                                logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
 
-                            # 刚复活瞬间强制洗牌，重新填满画面
-                            cw, ch, cx, cy = self._get_client_geometry(hwnd)
-                            if cw > 0 and ch > 0:
-                                self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
+                                # 刚复活瞬间强制洗牌，重新填满画面
+                                cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                                if cw > 0 and ch > 0:
+                                    self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
+                                    self._render_settlement_content(cw, ch)
+
+                        # 处于未最小化的普通游玩/拉伸状态，执行你原汁原味的几何同步
+                        cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                        if cw > 0 and ch > 0:
+                            geo_str = f"{cw}x{ch}+{cx}+{cy}"
+                            if self._last_geo != geo_str:
+                                self._last_geo = geo_str
+                                self.overlay.geometry(geo_str)
+                                # 如果玩家拉伸或拖动了窗口，完美触发你的 Canvas 刷新逻辑
                                 self._render_settlement_content(cw, ch)
+                except (TclError, Exception) as loop_err:
+                    logging.debug(f"[结算同步环异常] {loop_err}")
+            else:
+                # 如果玩家在结算单界面直接把模拟器关掉了，执行全盘安全熔断
+                logging.warning("[结算守护] 丢失模拟器句柄，安全熔断清理。")
+                self.close_overlay()
+                return
+        finally:
+            self._settlement_sync_active = False
 
-                    # 4. 处于未最小化的普通游玩/拉伸状态，执行你原汁原味的几何同步
-                    cw, ch, cx, cy = self._get_client_geometry(hwnd)
-                    if cw > 0 and ch > 0:
-                        geo_str = f"{cw}x{ch}+{cx}+{cy}"
-                        if self._last_geo != geo_str:
-                            self._last_geo = geo_str
-                            self.overlay.geometry(geo_str)
-                            # 如果玩家拉伸或拖动了窗口，完美触发你的 Canvas 刷新逻辑
-                            self._render_settlement_content(cw, ch)
-            except (TclError, Exception) as loop_err:
-                logging.debug(f"[结算同步环异常] {loop_err}")
-        else:
-            # 如果玩家在结算单界面直接把模拟器关掉了，执行全盘安全熔断
-            logging.warning("[结算守护] 丢失模拟器句柄，安全熔断清理。")
-            self.close_overlay()
-            return
-
-        # 维持高频同步
+        # 维持高频同步（放在 try-finally 外面）
         if self.settlement_active and self.overlay and self.overlay.winfo_exists():
             self.root.after(100, self._settlement_sync_loop)
 
@@ -1125,15 +1288,8 @@ class BSXSimulator:
             # 在这里拦截并强行恢复最小化的模拟器
             try:
                 # 向 Windows 查询当前模拟器的放置状态
-                class WINDOWPLACEMENT(ctypes.Structure):
-                    _fields_ = [
-                        ("length", ctypes.c_uint), ("flags", ctypes.c_uint), ("showCmd", ctypes.c_uint),
-                        ("ptMinPosition", ctypes.c_long * 2), ("ptMaxPosition", ctypes.c_long * 2),
-                        ("rcNormalPosition", ctypes.c_long * 4)
-                    ]
-
-                wp = WINDOWPLACEMENT()
-                wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+                wp = self._WINDOWPLACEMENT()
+                wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
 
                 if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
                     # showCmd == 2 代表当前确实处于最小化状态
@@ -1338,10 +1494,11 @@ class BSXSimulator:
         try:
             idx = (frame_idx + 1) % len(self.triforce_frames)
             self.canvas.itemconfig(img_id, image=self.triforce_frames[idx])
-            # 记录生成的定时器 ID
+            # 先创建定时器 ID
             t_id = self.root.after(100, lambda: self._animate_triforce(img_id, idx))
-            # 每次只保留当前生效的活跃动画句柄，防止长时间挂机列表无意义膨胀
+            # 先清理可能残留的相同 ID（防御性编程）
             self._anim_timers = [tid for tid in self._anim_timers if tid != t_id]
+            # 立即加入列表，防止漏清理
             self._anim_timers.append(t_id)
         except (TclError, Exception):
             pass
@@ -1444,14 +1601,14 @@ class BSXSimulator:
         """ 结局视频放完后的安全关闭：解除结算音频锁，并利用异步全盘清扫机制规避死锁 """
         logging.info("[主线程时序] 确认收到 <<EndingClose>> 事件，开始执行【结局防死锁安全解锁连招】...")
 
-        # 1. 解除音量锁，确保后续能够顺利恢复模拟器的声音
+        # 解除音量锁，确保后续能够顺利恢复模拟器的声音
         self.settlement_audio_locked = False
 
-        # 2. 如果 pygame 后台还在播放大结局的 WAV 广播配音，一并强行停掉
+        # 如果 pygame 后台还在播放大结局的 WAV 广播配音，一并强行停掉
+        self._stop_audio()
         try:
-            if pygame.mixer.get_init() and pygame.mixer.music.get_busy():
-                pygame.mixer.music.stop()
-                pygame.mixer.music.unload()
+            if pygame.mixer.get_init():
+                pass  # 音频系统正常
         except Exception as pg_unload_err:
             logging.warning(f"[音频重建] 监测到音频硬件异常，正在强行重启 Pygame 驱动: {pg_unload_err}")
             try:
@@ -1460,19 +1617,23 @@ class BSXSimulator:
             except pygame.error:
                 pass
 
-        # 3. 在主线程中只做事件解绑
+        # 在主线程中只做事件解绑
         if self.mpv_player:
             try:
                 self.mpv_player.event_callback('end-file')(None)
             except (AttributeError, ValueError):
                 pass
 
-        # 4.启动独立子线程去毁灭 MPV 实例，并在主线程中销毁组件、恢复模拟器声音、复位广播文件夹
+        # 启动独立子线程去毁灭 MPV 实例，并在主线程中销毁组件、恢复模拟器声音、复位广播文件夹
         self.close_overlay()
 
     def run(self):
-        logging.info("[系统启动] BS 塞尔达传说 广播模拟终端主窗体 Mainloop 开启。")
-        self.root.mainloop()
+        logging.info("[系统启动] 广播模拟终端主窗体 Mainloop 开启。")
+        try:
+            self.root.mainloop()
+        finally:
+            if pygame.mixer.get_init():  # 检查是否已初始化
+                pygame.mixer.quit()
         logging.info("[系统关闭] 主窗体 Mainloop 已退出。")
 
 
