@@ -1,6 +1,6 @@
 ﻿-- ============================================
 -- Satellaview (BS-X) 综合同步监控
--- 开发版本：2026.05.22 fix lock
+-- 开发版本：2026.06.02 Final
 -- 作者：AcFun 游戏咖啡馆 & AI Collaborator
 -- ============================================
 
@@ -46,6 +46,7 @@ local HAS_TRIGGERED_SETTLE = false
 local HAS_PRESSED_A      = false        -- 入场 A 键同步拦截位
 local HAS_GANON_SPAWNED  = false        -- 加农出现状态拦截位
 local is_input_disabled  = false        -- 默认放行按键
+local LAST_SIGNAL        = "FF"         -- 上次记录的章节信号
 
 local LAST_DEATHS, LAST_HEARTS, LAST_RUPEES, LAST_TRIFORCE, LAST_GANON = -1, -1, -1, -1, -1
 local frameCounter       = 0
@@ -57,10 +58,13 @@ local cachedDataFolder = nil
 local function writeToFile(filename, content)
     if not cachedDataFolder then
         cachedDataFolder = emu.getScriptDataFolder()
-        if not cachedDataFolder or cachedDataFolder == "" then return end
+        if not cachedDataFolder or cachedDataFolder == "" then
+            log("错误：无法获取脚本数据文件夹路径，请检查 Mesen 设置中是否允许 I/O 访问")
+            return
+        end
     end
-    
-    local path = cachedDataFolder .. "\\" .. filename
+
+    local path = cachedDataFolder .. "/" .. filename
     local file, err = io.open(path, "w")
     if file then
         file:write(content)
@@ -171,12 +175,12 @@ function monitorEverything()
     end
 
     -- 5. 结算数据统计
-    local rawDeaths   = emu.readWord(ADDR_DEATHS, sramMem, false) or 0
-    local rawHeartVal = emu.readWord(ADDR_HEART, sramMem, false) or 0
+    local rawDeaths   = emu.read16(ADDR_DEATHS, sramMem, false) or 0
+    local rawHeartVal = emu.read16(ADDR_HEART, sramMem, false) or 0
     local heartLoss   = math.floor(rawHeartVal / 2)
-    local totalRupees = emu.readWord(ADDR_RUPEE, sramMem, false) or 0
-    local triforce    = read(ADDR_TRIFORCE, sramMem, false) or 0
-    local ganonDefeat = read(ADDR_GANON_DEFEAT, sramMem, false) or 0
+    local totalRupees = emu.read16(ADDR_RUPEE, sramMem, false) or 0
+    local triforce    = emu.read(ADDR_TRIFORCE, sramMem, false) or 0
+    local ganonDefeat = emu.read(ADDR_GANON_DEFEAT, sramMem, false) or 0
 
     if rawDeaths ~= LAST_DEATHS or heartLoss ~= LAST_HEARTS or 
        totalRupees ~= LAST_RUPEES or triforce ~= LAST_TRIFORCE or 
