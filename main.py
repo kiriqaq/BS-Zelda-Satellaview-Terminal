@@ -109,10 +109,10 @@ class BSXSimulator:
         self.show_debug_ui = False
 
         self.root = Tk()
-        self.root.title("Satellaview Terminal 1.3.0")
+        self.root.title("Satellaview Terminal 1.3.1")
 
         window_w = int(340 * self.dpi_scale)
-        window_h = int((950 if self.show_debug_ui else 450) * self.dpi_scale)
+        window_h = int((950 if self.show_debug_ui else 520) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
@@ -162,6 +162,8 @@ class BSXSimulator:
         self.ganon_var = StringVar(value="？？？？？")
         # 初始化画面比例控制变量，默认开启(true)
         self.keep_aspect_ratio_var = StringVar(value="true")
+        self.ntsc_ratio_var = StringVar(value="false")  # 8:7 比例
+        self.fullscreen_optimize_var = StringVar(value="false")  # 全屏优化开关
         self._overlay_minimized_by_mesen = False
 
         self._setup_ui()
@@ -310,7 +312,7 @@ class BSXSimulator:
 
                     if modified_shortcuts > 0:
                         logging.info(
-                            f"[配置] 成功清除手柄快进/快退按键绑定 (共修改 {modified_shortcuts} 项)")
+                            f"[配置] 成功清除会影响时间轴的快捷键绑定 (共修改 {modified_shortcuts} 项)")
 
             # 保存修改后的完整 JSON 配置
             with open(settings_path, 'w', encoding='utf-8') as f:
@@ -340,21 +342,27 @@ class BSXSimulator:
 
         threading.Thread(target=fade, daemon=True, name="AudioFadeThread").start()
 
-    def _get_client_geometry(self, hwnd):
+    def _get_client_geometry(self, hwnd, fullscreen_optimize=False):
         rect = wintypes.RECT()
         windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left  # noqa
-        h = rect.bottom - rect.top  # noqa
+        w = rect.right - rect.left # noqa
+        h = rect.bottom - rect.top # noqa
         point = wintypes.POINT(0, 0)
         windll.user32.ClientToScreen(hwnd, ctypes.byref(point))
-        offset = int(25 * self.dpi_scale)
-        return w, h - offset, point.x, point.y + offset  # noqa
+
+        if fullscreen_optimize:
+            # 全屏优化模式：不减去偏移量，直接覆盖整个客户区
+            offset = 0
+        else:
+            offset = int(25 * self.dpi_scale)
+
+        return w, h - offset, point.x, point.y + offset # noqa
 
     def _setup_ui(self):
         # 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
-        dynamic_ui_font = ("Verdana", -int(26 * self.dpi_scale), "bold")
-        dynamic_monitor_font = ("Verdana", -int(14 * self.dpi_scale), "bold")
-        dynamic_tf_font = ("Verdana", -int(16 * self.dpi_scale), "bold")
+        dynamic_ui_font = ("Segoe UI", -int(26 * self.dpi_scale), "bold")
+        dynamic_monitor_font = ("Segoe UI", -int(14 * self.dpi_scale), "bold")
+        dynamic_tf_font = ("Segoe UI", -int(16 * self.dpi_scale), "bold")
 
         # 界面间距随 DPI 实时调整物理高度
         pad_5 = int(5 * self.dpi_scale)
@@ -395,7 +403,8 @@ class BSXSimulator:
             btn.pack(side="left", padx=pad_10)
             self.chapter_buttons.append(btn)
 
-        self.btn_select = Button(self.root, text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen, width=35, height=2)
+        self.btn_select = Button(self.root, text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen,
+                                 width=35, height=2)
         self.btn_select.pack(pady=pad_20)
 
         self.btn_stop = Button(self.root, text="重置状态（选择其他周）", command=self.reset_system, width=35, height=1,
@@ -407,16 +416,42 @@ class BSXSimulator:
                                       state="disabled", fg="#c0392b")
         self.btn_delete_save.pack(pady=pad_5)
 
-        # 画面比例控制勾选框
+        # 画面比例选择框架
+        ratio_frame = Frame(self.root, pady=pad_10)
+        ratio_frame.pack()
+
         self.chk_aspect = Checkbutton(
-            self.root,
-            text="勾选保持画面比例（防止拉伸变形）",
+            ratio_frame,
+            text="强制 4：3 画面比例",
             variable=self.keep_aspect_ratio_var,
+            onvalue="true",
+            offvalue="false",
+            activebackground=self.root.cget("bg"),
+            command=self._on_ratio_changed
+        )
+        self.chk_aspect.pack(side="left", padx=pad_5)
+
+        self.chk_ntsc = Checkbutton(
+            ratio_frame,
+            text="强制 NTSC 画面比例",
+            variable=self.ntsc_ratio_var,
+            onvalue="true",
+            offvalue="false",
+            activebackground=self.root.cget("bg"),
+            command=self._on_ntsc_changed
+        )
+        self.chk_ntsc.pack(side="left", padx=pad_5)
+
+        # 全屏优化勾选框
+        self.chk_fullscreen = Checkbutton(
+            self.root,
+            text="F11 全屏优化（不全屏不需要）",
+            variable=self.fullscreen_optimize_var,
             onvalue="true",
             offvalue="false",
             activebackground=self.root.cget("bg")
         )
-        self.chk_aspect.pack(pady=pad_10)
+        self.chk_fullscreen.pack(pady=pad_10)
 
         # 调试监视中心
         if self.show_debug_ui:
@@ -438,6 +473,25 @@ class BSXSimulator:
             self.btn_test = Button(monitor_section, text="立即测试数据", command=self.update_settlement_display,
                                    bg="#ecf0f1", height=1)
             self.btn_test.pack(pady=pad_5, fill="x")
+
+    def _on_ratio_changed(self):
+        """4:3 勾选时，自动取消 8:7 的勾选"""
+        if self.keep_aspect_ratio_var.get() == "true":
+            self.ntsc_ratio_var.set("false")
+
+    def _on_ntsc_changed(self):
+        """8:7 勾选时，自动取消 4:3 的勾选"""
+        if self.ntsc_ratio_var.get() == "true":
+            self.keep_aspect_ratio_var.set("false")
+
+    def _get_target_ratio(self):
+        """获取当前选择的目标比例 (width/height)"""
+        if self.ntsc_ratio_var.get() == "true":
+            # NTSC 8:7 勾选时，返回 4:3（因为素材是为 4:3 做的）
+            return 4 / 3
+        else:
+            # 否则（包括勾选 4:3 或都不勾选），返回 8:7
+            return 8 / 7
 
     def select_mesen(self):
         path = filedialog.askopenfilename(title="请选择模拟器根目录的 Mesen.exe ", filetypes=[("Mesen", "Mesen.exe")])
@@ -500,7 +554,8 @@ class BSXSimulator:
 
     def _activate_chapter_selection(self):
         self.status_var.set("请选择需要推送的版本")
-        self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal", command=self.activate_mode_selection)
+        self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal",
+                               command=self.activate_mode_selection)
 
     def activate_mode_selection(self):
         """第二步：提示用户选择表模式或里模式"""
@@ -594,19 +649,22 @@ class BSXSimulator:
             # Mesen 已选且 BIOS 存在，恢复到第二步（选择模式）
             self.btn_mode_m1.config(state="normal")
             self.btn_mode_m2.config(state="normal")
-            self.btn_select.config(state="normal", text="第 2 步：选择 表模式 / 里模式 ", command=self.activate_mode_selection)
+            self.btn_select.config(state="normal", text="第 2 步：选择 表模式 / 里模式 ",
+                                   command=self.activate_mode_selection)
             self.status_var.set("请选择需要推送的版本")
         elif self.mesen_dir:
             # Mesen 已选但 BIOS 不存在，恢复到第一步（需要选择 BIOS）
             self.btn_mode_m1.config(state="disabled")
             self.btn_mode_m2.config(state="disabled")
-            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen)
+            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ",
+                                   command=self.select_mesen)
             self.status_var.set("请定位模拟器的主程序 Mesen.exe ")
         else:
             # 没有任何配置，恢复到初始状态
             self.btn_mode_m1.config(state="disabled")
             self.btn_mode_m2.config(state="disabled")
-            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen)
+            self.btn_select.config(state="normal", text="第 1 步：选择模拟器根目录的 Mesen.exe ",
+                                   command=self.select_mesen)
             self.status_var.set("请定位模拟器的主程序 Mesen.exe ")
 
         # 章节按钮全部禁用（等待模式选择后再启用）
@@ -614,6 +672,8 @@ class BSXSimulator:
             btn.config(state="disabled")
 
         self.chk_aspect.config(state="normal")
+        self.chk_ntsc.config(state="normal")
+        self.chk_fullscreen.config(state="normal")
         logging.info("[系统指令] 系统复位完毕。")
 
     @staticmethod
@@ -702,6 +762,8 @@ class BSXSimulator:
             for btn in self.chapter_buttons:
                 btn.config(state="disabled")
             self.chk_aspect.config(state="disabled")
+            self.chk_ntsc.config(state="disabled")
+            self.chk_fullscreen.config(state="disabled")
 
             sat_dir = os.path.join(self.mesen_dir, "Satellaview")
             reset_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, "0")
@@ -922,9 +984,21 @@ class BSXSimulator:
             logging.info(f"[MPV内核] 开始挂载底层 MPV C引擎，绑定渲染句柄ID: {self.video_frame.winfo_id()}")
 
             # 根据 UI 勾选框状态动态决定 MPV 参数
-            is_keep = (self.keep_aspect_ratio_var.get() == "true")
-            mpv_keepaspect = 'yes' if is_keep else 'no'
-            mpv_aspect_override = '-1' if is_keep else 'no'
+            # 获取当前比例模式
+            is_4_3 = (self.keep_aspect_ratio_var.get() == "true")
+            is_8_7 = (self.ntsc_ratio_var.get() == "true")
+            is_keep = (is_4_3 or is_8_7)  # 只要勾选了任一比例，就启用 keepaspect
+
+            if is_keep:
+                mpv_keepaspect = 'yes'
+                # 根据选择的比例设置具体宽高比
+                if is_8_7:
+                    mpv_aspect_override = '4/3'
+                else:
+                    mpv_aspect_override = '8/7'
+            else:
+                mpv_keepaspect = 'no'
+                mpv_aspect_override = 'no'
 
             self.mpv_player = mpv.MPV(
                 wid=str(self.video_frame.winfo_id()),
@@ -1070,7 +1144,8 @@ class BSXSimulator:
 
                     # 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算
                     # 这样在视频初始化、切换视频瞬间，即使最小化，MPV 也能拿到安全有效的非零几何数据
-                    cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                    is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                    cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
 
                 # 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底
                 if cw <= 0 or ch <= 0:
@@ -1213,13 +1288,15 @@ class BSXSimulator:
                                 logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
 
                                 # 刚复活瞬间强制洗牌，重新填满画面
-                                cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                                is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                                cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
                                 if cw > 0 and ch > 0:
                                     self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
                                     self._render_settlement_content(cw, ch)
 
                         # 处于未最小化的普通游玩/拉伸状态，执行你原汁原味的几何同步
-                        cw, ch, cx, cy = self._get_client_geometry(hwnd)
+                        is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                        cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
                         if cw > 0 and ch > 0:
                             geo_str = f"{cw}x{ch}+{cx}+{cy}"
                             if self._last_geo != geo_str:
@@ -1237,7 +1314,7 @@ class BSXSimulator:
         finally:
             self._settlement_sync_active = False
 
-        # 维持高频同步（放在 try-finally 外面）
+        # 维持高频同步
         if self.settlement_active and self.overlay and self.overlay.winfo_exists():
             self.root.after(100, self._settlement_sync_loop)
 
@@ -1308,7 +1385,8 @@ class BSXSimulator:
                 logging.debug(f"[结算唤醒异常] {e}")
 
             # 此时模拟器已经物理复位，计算出来的绝对是最精准的正常高宽！
-            cw, ch, cx, cy = self._get_client_geometry(hwnd)
+            is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+            cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
 
         self._last_geo = f"{cw}x{ch}+{cx}+{cy}"
         self.overlay.geometry(self._last_geo)
@@ -1324,10 +1402,43 @@ class BSXSimulator:
         self._render_settlement_content(cw, ch)
         self._settlement_sync_loop()
 
-    def _render_settlement_content(self, cw, ch):
+    def _render_settlement_content(self, container_w, container_h):
         try:
             self._clear_animation_timers()
             self.canvas.delete("all")
+
+            # 计算实际渲染区域（考虑保持比例）
+            # 只要勾选了 4:3 或 8:7 任一，就启用比例保持
+            is_keep_aspect = (self.keep_aspect_ratio_var.get() == "true" or self.ntsc_ratio_var.get() == "true")
+
+            if is_keep_aspect:
+                # SFC 原始比例 8:7 接近方形，但通常显示为 4:3（256x224）
+                # 使用 256/224 = 1.142857 作为目标比例
+                target_ratio = self._get_target_ratio()
+
+                container_ratio = container_w / container_h
+
+                if container_ratio > target_ratio:
+                    # 容器更宽，上下黑边
+                    render_h = container_h
+                    render_w = int(render_h * target_ratio)
+                    offset_x = (container_w - render_w) // 2
+                    offset_y = 0
+                else:
+                    # 容器更高，左右黑边
+                    render_w = container_w
+                    render_h = int(render_w / target_ratio)
+                    offset_x = 0
+                    offset_y = (container_h - render_h) // 2
+            else:
+                # 拉伸填满
+                render_w, render_h = container_w, container_h
+                offset_x, offset_y = 0, 0
+
+            # 可选：绘制黑边区域（保持画面比例的情况下填充黑色）
+            if is_keep_aspect:
+                self.canvas.create_rectangle(0, 0, container_w, container_h, fill="black", outline="")
+
             tf_val = self.update_settlement_display()
             rom_chapter = self.read_lua_file("chapter_signal.txt")
             final_ch = str(self.selected_chapter)
@@ -1338,46 +1449,50 @@ class BSXSimulator:
 
             bg_path = os.path.join("ui", "bg_result.png")
             if os.path.exists(bg_path):
-                bg_img = Image.open(bg_path).resize((cw, ch), Image.Resampling.LANCZOS)
+                bg_img = Image.open(bg_path).resize((render_w, render_h), Image.Resampling.LANCZOS)
                 self.bg_image_ref = ImageTk.PhotoImage(bg_img)
-                self.canvas.create_image(0, 0, anchor="nw", image=self.bg_image_ref)
+                self.canvas.create_image(offset_x, offset_y, anchor="nw", image=self.bg_image_ref)
 
-            # 基础字号转换：直接随模拟器窗口高度等比缩放
-            f_size = -max(12, int(ch * 0.055))
-            tf_size_val = int(cw * 0.055)
+            # 字号随渲染区域高度缩放
+            f_size = -max(12, int(render_h * 0.055))
+            tf_size_val = int(render_w * 0.055)
 
-            # 布局边界直接采用物理边界，保证缩放百分比随动
-            logical_cw = cw
-            logical_ch = ch
+            # 布局坐标基于渲染区域（需要加上偏移量）
+            center_x = offset_x + render_w / 2
+            logical_w = render_w
+            logical_h = render_h
 
-            self.canvas.create_text(logical_cw / 2, logical_ch * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
-                                    font=("Verdana", f_size))
-            self.canvas.create_text(logical_cw / 2, logical_ch * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
-                                    font=("Verdana", f_size))
+            self.canvas.create_text(center_x, offset_y + logical_h * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
+                                    font=("Segoe UI", f_size))
+            self.canvas.create_text(center_x, offset_y + logical_h * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
+                                    font=("Segoe UI", f_size))
 
-            label_x, value_x, curr_y, spacing = logical_cw * 0.15, logical_cw * 0.42, logical_ch * 0.30, logical_ch * 0.09
+            label_x = offset_x + logical_w * 0.15
+            value_x = offset_x + logical_w * 0.42
+            curr_y = offset_y + logical_h * 0.30
+            spacing = logical_h * 0.09
 
             self.canvas.create_text(label_x, curr_y, text=self.ganon_var.get(), fill="#FFFFFF",
-                                    font=("Verdana", f_size), anchor="w")
+                                    font=("Segoe UI", f_size), anchor="w")
             curr_y += spacing
-            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=("Verdana", f_size),
+            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=("Segoe UI", f_size),
                                     anchor="w")
 
-            # 缩放适配的 GIF 帧大小（物理像素需求）
+            # 三角力量图标
             self.triforce_frames = self._load_gif_frames(
-                os.path.join("ui", "triforce_on.gif"), (int(cw * 0.055), int(cw * 0.055)))
+                os.path.join("ui", "triforce_on.gif"), (int(render_w * 0.055), int(render_w * 0.055)))
             off_path = os.path.join("ui", "triforce_off.png")
 
             tf_bits = [int(b) for b in bin(tf_val)[2:].zfill(8)]
             for i, bit in enumerate(tf_bits):
-                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int(cw * 0.01)))
+                cur_x = (value_x + tf_size_val / 2) + (i * (tf_size_val + int(render_w * 0.01)))
                 if bit == 1 and self.triforce_frames:
                     img_id = self.canvas.create_image(cur_x, curr_y, image=self.triforce_frames[0], anchor="center")
                     self._animate_triforce(img_id, 0)
                 elif os.path.exists(off_path):
-                    # 物理像素缩放
                     off_img = ImageTk.PhotoImage(
-                        Image.open(off_path).resize((int(cw * 0.055), int(cw * 0.055)), Image.Resampling.LANCZOS))
+                        Image.open(off_path).resize((int(render_w * 0.055), int(render_w * 0.055)),
+                                                    Image.Resampling.LANCZOS))
                     self.canvas.create_image(cur_x, curr_y, image=off_img, anchor="center")
                     self.ui_refs.append(off_img)
 
@@ -1386,19 +1501,19 @@ class BSXSimulator:
                     self.rupee_var.get().split(":")[-1].strip()]
             for i in range(3):
                 curr_y += spacing
-                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=("Verdana", f_size),
+                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=("Segoe UI", f_size),
                                         anchor="w")
-                self.canvas.create_text(logical_cw * 0.85, curr_y, text=vals[i], fill="#FFFFFF",
-                                        font=("Verdana", f_size),
-                                        anchor="e")
+                self.canvas.create_text(offset_x + logical_w * 0.85, curr_y, text=vals[i], fill="#FFFFFF",
+                                        font=("Segoe UI", f_size), anchor="e")
 
-            self.canvas.create_rectangle(logical_cw * 0.1, logical_ch * 0.85, logical_cw * 0.9, logical_ch * 0.93,
+            self.canvas.create_rectangle(offset_x + logical_w * 0.1, offset_y + logical_h * 0.85,
+                                         offset_x + logical_w * 0.9, offset_y + logical_h * 0.93,
                                          outline="#F1C40F", width=2)
 
-            self.canvas.create_text(logical_cw / 2, logical_ch * 0.89, text="按下任意键继续", fill="#FFFFFF",
-                                    font=("Verdana", f_size))
+            self.canvas.create_text(center_x, offset_y + logical_h * 0.89, text="按下任意键继续", fill="#FFFFFF",
+                                    font=("Segoe UI", f_size))
 
-            logging.info("[结算渲染] 画布第一页内容抗 DPI 缩放适配渲染完毕。")
+            logging.info("[结算渲染] 结算界面比例适配渲染完毕。")
 
         except TclError:
             pass
@@ -1559,9 +1674,21 @@ class BSXSimulator:
 
             try:
                 # 根据 UI 勾选框状态动态决定大结局 MPV 参数
-                is_keep = (self.keep_aspect_ratio_var.get() == "true")
-                mpv_keepaspect = 'yes' if is_keep else 'no'
-                mpv_aspect_override = '-1' if is_keep else 'no'
+                # 获取当前比例模式
+                is_4_3 = (self.keep_aspect_ratio_var.get() == "true")
+                is_8_7 = (self.ntsc_ratio_var.get() == "true")
+                is_keep = (is_4_3 or is_8_7)  # 只要勾选了任一比例，就启用 keepaspect
+
+                if is_keep:
+                    mpv_keepaspect = 'yes'
+                    # 根据选择的比例设置具体宽高比
+                    if is_8_7:
+                        mpv_aspect_override = '4/3'
+                    else:
+                        mpv_aspect_override = '8/7'
+                else:
+                    mpv_keepaspect = 'no'
+                    mpv_aspect_override = 'no'
 
                 self.mpv_player = mpv.MPV(
                     wid=str(self.video_frame.winfo_id()),
