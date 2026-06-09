@@ -1,6 +1,6 @@
 ﻿-- ============================================
 -- Satellaview (BS-X) 综合同步监控
--- 开发版本：2026.06.02 Final
+-- 开发版本：2026.06.09 (macOS 兼容修复)
 -- 作者：AcFun 游戏咖啡馆 & AI Collaborator
 -- ============================================
 
@@ -57,10 +57,32 @@ local load_callback_handle = nil        -- 防重复注册的硬件回调句柄
 local cachedDataFolder = nil
 local function writeToFile(filename, content)
     if not cachedDataFolder then
-        cachedDataFolder = emu.getScriptDataFolder()
-        if not cachedDataFolder or cachedDataFolder == "" then
-            log("错误：无法获取脚本数据文件夹路径，请检查 Mesen 设置中是否允许 I/O 访问")
-            return
+        local folder = emu.getScriptDataFolder()
+        if type(folder) == "string" and folder ~= "" then
+            -- 追加 /bs 子目录（若路径尚未以 /bs 或 \bs 结尾）
+            local _, endPos = string.find(folder, "[/\\]bs$")
+            if not endPos then
+                folder = folder .. "/bs"
+            end
+            cachedDataFolder = folder
+        else
+            -- macOS/受限环境：尝试 emu.getPath(14) 作为备选
+            pcall(function() folder = emu.getPath(14) end)
+            if type(folder) == "string" and folder ~= "" then
+                cachedDataFolder = folder .. "/bs"
+            else
+                -- 最终降级：手动构造路径
+                local home = os.getenv("HOME") or os.getenv("USERPROFILE") or "."
+                if home == "." then
+                    cachedDataFolder = "LuaScriptData\\bs"
+                else
+                    cachedDataFolder = home .. "/Library/Application Support/MesenCE/LuaScriptData/bs"
+                end
+                log("[bs.lua] 使用降级路径: " .. cachedDataFolder)
+                pcall(function()
+                    os.execute("mkdir -p '" .. cachedDataFolder:gsub("'", "'\\''") .. "'")
+                end)
+            end
         end
     end
 
@@ -70,7 +92,7 @@ local function writeToFile(filename, content)
         file:write(content)
         file:close()
     else
-        log(string.format("无法写入文件 %s: %s", filename, (err or "未知错误")))
+        log(string.format("[bs.lua] 无法写入 %s: %s", filename, (err or "未知错误")))
     end
 end
 

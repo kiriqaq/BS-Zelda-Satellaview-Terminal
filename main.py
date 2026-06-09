@@ -1,57 +1,124 @@
 # -*- coding: utf-8 -*-
 import ctypes
-
-try:
-    # 优先尝试启用 Windows 10 推荐的 Per-Monitor (V2) DPI 感知
-    # 如果对应的 shcore.dll 存在且函数可用，则执行该条
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except (AttributeError, OSError):
-    try:
-        # 如果系统版本较低（如未升级的 Win8.1），回退到普通系统级 DPI 感知
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except (AttributeError, OSError):
-        try:
-            # 如果处于非常古老的 Windows 7 / Vista 环境，调用最初代的全局 DPI 感知
-            ctypes.windll.user32.SetProcessDPIAware()
-        except (AttributeError, OSError):
-            # 极端的非 Windows 环境（如 Linux/Mac 测试编译）或彻底损坏的系统底层，执行无痛静默保底
-            pass
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
-from ctypes import windll, wintypes
 from datetime import datetime, timedelta
 from tkinter import (Tk, Label, filedialog, StringVar, Checkbutton, Button, Frame, Toplevel, Canvas, messagebox,
                      TclError)
 
 import pygame
-import pygetwindow as gw
 from PIL import Image, ImageTk
 
-# 强行注入 MPV DLL 绝对路径
+from platform import PlatformBackend, IS_MACOS, IS_WINDOWS
+
+# 工作目录
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _INTERNAL_DIR = os.path.join(_CURRENT_DIR, "_internal")
 
-# 将 根目录 和 _internal 目录全部灌入 Windows 的 DLL 搜索网络
-if hasattr(os, "add_dll_directory"):
-    for dll_path in [_CURRENT_DIR, _INTERNAL_DIR]:
-        if os.path.exists(dll_path):
+# ========== 资源配置 ==========
+
+def _get_config_path():
+    """返回配置文件路径（macOS 用 ~/Library/Application Support/，Windows 用脚本目录）"""
+    if IS_MACOS:
+        app_support = os.path.expanduser("~/Library/Application Support/SatellaviewTerminal")
+        os.makedirs(app_support, exist_ok=True)
+        return os.path.join(app_support, "terminal_config.json")
+    return os.path.join(_CURRENT_DIR, "terminal_config.json")
+
+
+_CONFIG_FILE = _get_config_path()
+
+def get_resource_path(*segments):
+    """获取资源绝对路径，兼容开发模式和 PyInstaller 打包模式"""
+    base = getattr(sys, '_MEIPASS', _CURRENT_DIR)
+    return os.path.join(base, *segments)
+
+
+def _load_config():
+    """从 JSON 配置文件加载用户上次的选择"""
+    if os.path.exists(_CONFIG_FILE):
+        try:
+            with open(_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_config(data):
+    """原子写入 JSON 配置文件"""
+    tmp = _CONFIG_FILE + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _CONFIG_FILE)
+    except OSError:
+        pass
+
+
+def _detect_base_dir():
+    """自动检测 base_dir：检查当前目录和常见位置是否存在 bszelda 资源"""
+    candidates = [
+        _CURRENT_DIR,
+        os.path.join(_CURRENT_DIR, ".."),
+        os.path.expanduser("~"),
+        os.path.expanduser("~/Documents"),
+        os.path.expanduser("~/Downloads"),
+    ]
+    # 检查 /Volumes 下的常见挂载点
+    volumes = "/Volumes"
+    if os.path.isdir(volumes):
+        try:
+            for entry in os.listdir(volumes):
+                full = os.path.join(volumes, entry)
+                if os.path.isdir(full):
+                    candidates.append(full)
+        except OSError:
+            pass
+    for d in list(candidates):
+        resolved = os.path.abspath(d)
+        candidates.append(os.path.expanduser(resolved))
+    for d in candidates:
+        if os.path.isdir(os.path.join(d, "bszelda")):
+            return os.path.abspath(d)
+    return _CURRENT_DIR
+
+# ========== 平台初始化 ==========
+
+# 仅 Windows: 启用 DPI 感知
+if IS_WINDOWS:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
             try:
-                os.add_dll_directory(dll_path)
-            except OSError:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
                 pass
 
-# 同时确保环境变量 PATH 把这两个地方全部覆盖，防止老系统加载失败
-os.environ["PATH"] = (
+# 仅 Windows: 注入 MPV DLL 搜索路径
+if IS_WINDOWS:
+    if hasattr(os, "add_dll_directory"):
+        for dll_path in [_CURRENT_DIR, _INTERNAL_DIR]:
+            if os.path.exists(dll_path):
+                try:
+                    os.add_dll_directory(dll_path)
+                except OSError:
+                    pass
+    os.environ["PATH"] = (
         _CURRENT_DIR + os.pathsep +
         _INTERNAL_DIR + os.pathsep +
         os.environ.get("PATH", "")
-)
+    )
 
 # 引入 MPV 核心库
 try:
@@ -62,20 +129,31 @@ except ImportError:
 
 # 核心依赖库加载与初始化
 try:
-    from pycaw.pycaw import AudioUtilities
-except ImportError:
-    logging.error("未检测到 pycaw 库，请执行: pip install pycaw")
-    AudioUtilities = None
-
-try:
     pygame.mixer.init()
 except pygame.error as pg_err:
     logging.error(f"无法初始化音频设备: {pg_err}")
 
 # 全局常量配置
-TARGET_WINDOW_TITLE = 'Mesen - bs'  # 目标模拟器窗口的标题关键字
+TARGET_WINDOW_TITLE = 'Mesen'  # 匹配 'MesenCE - bs' 和 'Mesen - bs'
 SIGNAL_CHECK_INTERVAL = 0.2  # 轮询 Lua 信号文件的时间间隔（秒）
 RETRY_DELAY = 0.05  # 文件读取冲突时的重试延迟
+
+
+def _resolve_file_case(path):
+    """大小写不敏感的文件查找，返回实际存在文件的路径，若无匹配则返回原始路径"""
+    if os.path.exists(path):
+        return path
+    dir_name = os.path.dirname(path)
+    base_name = os.path.basename(path)
+    if not os.path.isdir(dir_name):
+        return path
+    try:
+        for entry in os.listdir(dir_name):
+            if entry.lower() == base_name.lower():
+                return os.path.join(dir_name, entry)
+    except OSError:
+        pass
+    return path
 
 # 日志配置
 logging.basicConfig(
@@ -87,32 +165,30 @@ logging.basicConfig(
 )
 
 
+_FONT_FAMILY = "Segoe UI" if IS_WINDOWS else "Helvetica"
+
+
 class BSXSimulator:
     """
     BS 塞尔达广播模拟终端主类
     """
 
-    # 定义 Windows 窗口位置结构体
-    class _WINDOWPLACEMENT(ctypes.Structure):
-        _fields_ = [
-            ("length", ctypes.c_uint),
-            ("flags", ctypes.c_uint),
-            ("showCmd", ctypes.c_uint),
-            ("ptMinPosition", ctypes.c_long * 2),
-            ("ptMaxPosition", ctypes.c_long * 2),
-            ("rcNormalPosition", ctypes.c_long * 4)
-        ]
-
     def __init__(self):
-        # 初始化系统环境
-        self.dpi_scale = self._get_system_dpi_scale()
+        # 初始化平台后端与系统环境
+        self.platform = PlatformBackend()
+        self.dpi_scale = self.platform.get_dpi_scale()
         self.show_debug_ui = False
 
+        # 加载用户配置
+        saved = _load_config()
+        self.base_dir = saved.get("base_dir", _detect_base_dir())
+        self._saved_mesen_path = saved.get("mesen_path", "")
+
         self.root = Tk()
-        self.root.title("Satellaview Terminal 1.3.1")
+        self.root.title("Satellaview Terminal 1.4.0")
 
         window_w = int(340 * self.dpi_scale)
-        window_h = int((950 if self.show_debug_ui else 520) * self.dpi_scale)
+        window_h = int((950 if self.show_debug_ui else 580) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
         self.root.resizable(False, False)
 
@@ -172,31 +248,8 @@ class BSXSimulator:
         self.root.bind("<<VideoEndRouting>>", lambda e: self._safe_trigger_video_routing())
         self.root.bind("<<EndingClose>>", lambda e: self._safe_trigger_ending_close())
 
-    @staticmethod
-    def _get_system_dpi_scale(hwnd=None):
-        """ 获取系统实时的 DPI 缩放比例 """
-        try:
-            # 如果传入了具体的窗口句柄，优先获取该窗口当前所在的具体屏幕的实时 DPI
-            if hwnd and hasattr(ctypes.windll.user32, "GetDpiForWindow"):
-                dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
-                return dpi / 96.0
-
-            # 现代 Windows 10 / 11 推荐的获取系统总 DPI 的标准 API
-            if hasattr(ctypes.windll.user32, "GetDpiForSystem"):
-                dpi = ctypes.windll.user32.GetDpiForSystem()
-                return dpi / 96.0
-        except Exception as e:
-            logging.warning(f"[DPI获取] 现代API调用失败: {e}，将尝试传统方法保底")
-
-        try:
-            logpixelsx = 88
-            hdc = ctypes.windll.user32.GetDC(0)
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, logpixelsx)
-            ctypes.windll.user32.ReleaseDC(0, hdc)
-            return dpi / 96.0
-        except Exception as e:
-            logging.warning(f"[DPI获取] 传统方法也失败: {e}，默认返回 1.0")
-            return 1.0
+    def _get_system_dpi_scale(self, hwnd=None):
+        return self.platform.get_dpi_scale(hwnd)
 
     @staticmethod
     def _load_gif_frames(path, size):
@@ -213,37 +266,17 @@ class BSXSimulator:
             return []
 
     def _set_mesen_mute(self, mute=True):
-        if AudioUtilities is None:
-            logging.warning("[音频同步] 由于未安装 pycaw 库，无法控制模拟器静音")
-            return False
+        if not self.platform.has_per_app_audio and not self._mesen_audio_session:
+            self.platform.mute_app(None, mute)
+            return True
 
-        with self._audio_lock:  # 强行加锁，保证同一时间只有一个线程能操作 pycaw
-            # 检查缓存，同时必须验证这个进程是不是还在正常运行
-            if self._mesen_audio_session:
-                try:
-                    # 通过直接获取常驻进程状态探活
-                    if self._mesen_audio_session.Process and self._mesen_audio_session.Process.status == "running":
-                        self._mesen_audio_session.SetMute(1 if mute else 0, None)
-                        logging.info(f"[音频同步] 通过安全缓存控制 Mesen 模拟器{'静音' if mute else '恢复音量'}")
-                        return True
-                    else:
-                        raise ValueError("Mesen process is no longer running")
-                except(ValueError, AttributeError, OSError):
-                    logging.warning("[音频同步] 缓存的 Mesen 音频句柄已失效或进程已变动，尝试重新获取...")
-                    self._mesen_audio_session = None
-
-            # 2. 重新捕获
-            try:
-                sessions = AudioUtilities.GetAllSessions()
-                for session in sessions:
-                    if session.Process and session.Process.name().lower() == "mesen.exe":
-                        self._mesen_audio_session = session.SimpleAudioVolume
-                        self._mesen_audio_session.SetMute(1 if mute else 0, None)
-                        logging.info(f"[音频同步] 成功捕获并重新缓存 Mesen 音频句柄")
-                        return True
-            except Exception as e:
-                logging.error(f"音量控制或捕获失败: {e}")
-            return False
+        with self._audio_lock:
+            success, new_session = self.platform.mute_app(
+                self._mesen_audio_session, mute
+            )
+            if new_session:
+                self._mesen_audio_session = new_session
+            return success or not self.platform.has_per_app_audio
 
     @staticmethod
     def _play_audio(path, volume=1.0, loop=False):
@@ -274,11 +307,30 @@ class BSXSimulator:
             logging.warning(f"[音频] 停止时出现异常: {e}")
 
     def _patch_mesen_settings(self):
-        settings_path = os.path.join(self.mesen_dir, "settings.json")
+        settings_path = self.platform.get_settings_path(self.mesen_dir)
         if not os.path.exists(settings_path):
-            logging.warning(f"[配置] 未找到配置文件: {settings_path}")
-            return
+            fallback_path = os.path.join(self.mesen_dir, "settings.json")
+            if os.path.exists(fallback_path):
+                settings_path = fallback_path
+            else:
+                return self._create_default_mesen_settings(settings_path)
 
+        self._apply_mesen_patches(settings_path)
+
+    def _create_default_mesen_settings(self, settings_path):
+        config = {
+            "Snes": {"BsxUseCustomTime": True, "BsxCustomTime": "09:59:00"},
+        }
+        try:
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            logging.info("[配置] 已创建默认 MesenCE settings.json，请手动开启 Script→Settings→Script Window→Restrictions→Allow IO access")
+            return self._apply_mesen_patches(settings_path)
+        except OSError as e:
+            logging.error(f"[配置] 无法创建默认 settings.json: {e}")
+
+    def _apply_mesen_patches(self, settings_path):
         try:
             with open(settings_path, 'r', encoding='utf-8-sig') as f:
                 config = json.load(f)
@@ -342,27 +394,14 @@ class BSXSimulator:
 
         threading.Thread(target=fade, daemon=True, name="AudioFadeThread").start()
 
-    def _get_client_geometry(self, hwnd, fullscreen_optimize=False):
-        rect = wintypes.RECT()
-        windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left # noqa
-        h = rect.bottom - rect.top # noqa
-        point = wintypes.POINT(0, 0)
-        windll.user32.ClientToScreen(hwnd, ctypes.byref(point))
-
-        if fullscreen_optimize:
-            # 全屏优化模式：不减去偏移量，直接覆盖整个客户区
-            offset = 0
-        else:
-            offset = int(25 * self.dpi_scale)
-
-        return w, h - offset, point.x, point.y + offset # noqa
+    def _get_client_geometry(self, win, fullscreen_optimize=False):
+        return self.platform.get_window_geometry(win, self.dpi_scale, fullscreen_optimize)
 
     def _setup_ui(self):
         # 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
-        dynamic_ui_font = ("Segoe UI", -int(26 * self.dpi_scale), "bold")
-        dynamic_monitor_font = ("Segoe UI", -int(14 * self.dpi_scale), "bold")
-        dynamic_tf_font = ("Segoe UI", -int(16 * self.dpi_scale), "bold")
+        dynamic_ui_font = (_FONT_FAMILY, -int(26 * self.dpi_scale), "bold")
+        dynamic_monitor_font = (_FONT_FAMILY, -int(14 * self.dpi_scale), "bold")
+        dynamic_tf_font = (_FONT_FAMILY, -int(16 * self.dpi_scale), "bold")
 
         # 界面间距随 DPI 实时调整物理高度
         pad_5 = int(5 * self.dpi_scale)
@@ -406,6 +445,10 @@ class BSXSimulator:
         self.btn_select = Button(self.root, text="第 1 步：选择模拟器根目录的 Mesen.exe ", command=self.select_mesen,
                                  width=35, height=2)
         self.btn_select.pack(pady=pad_20)
+
+        self.btn_base_dir = Button(self.root, text="自定义资源目录（可选）", command=self.select_base_dir,
+                                   width=35, height=1)
+        self.btn_base_dir.pack(pady=pad_5)
 
         self.btn_stop = Button(self.root, text="重置状态（选择其他周）", command=self.reset_system, width=35, height=1,
                                state="disabled")
@@ -493,30 +536,78 @@ class BSXSimulator:
             # 否则（包括勾选 4:3 或都不勾选），返回 8:7
             return 8 / 7
 
-    def select_mesen(self):
-        path = filedialog.askopenfilename(title="请选择模拟器根目录的 Mesen.exe ", filetypes=[("Mesen", "Mesen.exe")])
+    def select_base_dir(self):
+        """用户自定义资源根目录（bszelda 所在目录的父级）"""
+        path = filedialog.askdirectory(title="请选择 bszelda 资源所在的根目录（包含 bszelda 文件夹的那一层）")
         if path:
-            self.mesen_path = path
-            self.mesen_dir = os.path.dirname(path)
-            self._patch_mesen_settings()
-            self.lua_data_dir = os.path.join(self.mesen_dir, "LuaScriptData", "bs")
-            self.bs_sfc_path = os.path.join(self.mesen_dir, "bszelda", "bs.sfc")
-            self.btn_delete_save.config(state="normal")
-            if not os.path.exists(self.bs_sfc_path):
-                self._handle_missing_bios()
-            else:
-                # BIOS 存在，启用模式按钮
-                self.btn_mode_m1.config(state="normal")
-                self.btn_mode_m2.config(state="normal")
-                # 修改主按钮为"第二步：请选择表/里模式"
-                self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal",
-                                       command=self.activate_mode_selection)
-                self._activate_chapter_selection()
+            path = os.path.abspath(path)
+            # 规范化：若用户选了 bszelda 目录本身，取其父目录
+            if os.path.basename(path) == "bszelda":
+                path = os.path.dirname(path)
+                logging.info(f"[base_dir] 自动规范化到 bszelda 父目录: {path}")
+            self.base_dir = path
+            self._save_user_config()
+            self._update_base_dir_ui()
+            if self.mesen_dir:
+                self.bs_sfc_path = os.path.join(self.base_dir, "bszelda", "bs.sfc")
+
+    def _save_user_config(self):
+        _save_config({
+            "base_dir": self.base_dir,
+            "mesen_path": self._saved_mesen_path,
+        })
+
+    def _update_base_dir_ui(self):
+        short = self.base_dir
+        if len(short) > 40:
+            short = "..." + short[-37:]
+        self.btn_base_dir.config(
+            text=f"资源目录: {short}",
+            fg="#27ae60"
+        )
+
+    def select_mesen(self):
+        if IS_MACOS:
+            # macOS NSOpenPanel 不支持按 .app 扩展名过滤 (需 UTI)
+            # askopenfilename 将 .app bundle 视为不透明文件，因此可选中
+            path = filedialog.askopenfilename(
+                title="请选择 Mesen.app",
+                filetypes=[("All files", "*")]
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="请选择模拟器根目录的 Mesen.exe",
+                filetypes=[("Mesen", "Mesen.exe")]
+            )
+
+        if not path:
+            return
+
+        self.mesen_path = self.platform.validate_app_path(path)
+        self.mesen_dir = os.path.dirname(path) if not path.endswith('.app') else path
+        if IS_WINDOWS:
+            self.platform.set_app_base_dir(self.mesen_dir)
+        self._saved_mesen_path = self.mesen_path
+        self._save_user_config()
+        self.platform.ensure_dirs()
+        self._patch_mesen_settings()
+        self.lua_data_dir = self.platform.get_lua_data_dir(self.mesen_dir)
+        self.bs_sfc_path = os.path.join(self.base_dir, "bszelda", "bs.sfc")
+        self._update_base_dir_ui()
+        self.btn_delete_save.config(state="normal")
+        if not os.path.exists(self.bs_sfc_path):
+            self._handle_missing_bios()
+        else:
+            # BIOS 存在，启用模式按钮
+            self.btn_mode_m1.config(state="normal")
+            self.btn_mode_m2.config(state="normal")
+            # 修改主按钮为"第二步：请选择表/里模式"
+            self.btn_select.config(text="第 2 步：选择 表模式 / 里模式 ", state="normal",
+                                   command=self.activate_mode_selection)
+            self._activate_chapter_selection()
 
     def delete_bios_save(self):
-        if not self.mesen_dir:
-            return
-        save_file_path = os.path.join(self.mesen_dir, "saves", "BsxBios.srm")
+        save_file_path = os.path.join(self.platform.get_saves_dir(), "BsxBios.srm")
         confirm = messagebox.askyesno("删除存档确认",
                                       "确定要删除 BS-X BIOS 存档（BsxBios.srm）吗？\n此操作将清除游戏内注册的角色和所有广播游戏的进度。")
         if confirm:
@@ -753,6 +844,9 @@ class BSXSimulator:
             # 禁用主按钮，防止重复点击
             self.btn_select.config(state="disabled")
 
+            # 确保 Lua IPC 目录存在
+            self.platform.ensure_dirs()
+
             # 确保模式按钮被禁用
             self.btn_mode_m1.config(state="disabled")
             self.btn_mode_m2.config(state="disabled")
@@ -765,8 +859,8 @@ class BSXSimulator:
             self.chk_ntsc.config(state="disabled")
             self.chk_fullscreen.config(state="disabled")
 
-            sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-            reset_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, "0")
+            sat_dir = self.platform.get_satellaview_dir()
+            reset_dir = os.path.join(self.base_dir, "bszelda", self.selected_mode, "0")
             logging.info(f"[广播数据] 源路径: {reset_dir}")
             logging.info(f"[广播数据] 目标路径: {sat_dir}")
 
@@ -785,9 +879,9 @@ class BSXSimulator:
                 logging.error(f"[广播数据] 源文件夹不存在: {reset_dir}")
 
             bs_rom = self.bs_sfc_path
-            bs_lua = os.path.join("bs.lua")
+            bs_lua = get_resource_path("bs.lua")
             try:
-                subprocess.Popen([self.mesen_path, bs_rom, bs_lua])
+                self.platform.launch_app(self.mesen_path, [bs_rom, bs_lua])
                 self.root.after(2000, lambda: self._set_mesen_mute(False))
             except (subprocess.SubprocessError, OSError) as err:
                 messagebox.showerror("启动失败", f"无法启动 Mesen: {err}")
@@ -814,7 +908,7 @@ class BSXSimulator:
             if match:
                 final_ch = match.group(1)
 
-        audio_path = os.path.join(self.mesen_dir, "bszelda", "wav", f"ED{final_ch}.wav")
+        audio_path = _resolve_file_case(os.path.join(self.base_dir, "bszelda", "wav", f"ED{final_ch}.wav"))
         if os.path.exists(audio_path):
             self._play_audio(audio_path, volume=1.0)
         else:
@@ -890,10 +984,9 @@ class BSXSimulator:
             self.ganon_mute_timer = self.root.after(3000, delayed_restore)
 
     def _get_mesen_window(self):
-        if self._target_window and self._target_window.visible:
+        if self._target_window and self._target_window.get("visible", True):
             return self._target_window
-        wins = [w for w in gw.getWindowsWithTitle(TARGET_WINDOW_TITLE) if w.visible]
-        self._target_window = wins[0] if wins else None
+        self._target_window = self.platform.find_window(TARGET_WINDOW_TITLE)
         return self._target_window
 
     def play_story_video(self, video_name):
@@ -923,12 +1016,12 @@ class BSXSimulator:
 
         force_wait_sync = (video_name == "wait" or remaining_sec <= story_len)
         if force_wait_sync:
-            target_video = os.path.join(self.mesen_dir, "bszelda", "video", "wait.mp4")
+            target_video = os.path.join(self.base_dir, "bszelda", "video", "wait.mp4")
             start_pos = max(0, int(wait_len - remaining_sec))
             self.is_waiting_video_mode = True
             logging.info(f"[播放管道] 切换为等待平铺视频(wait.mp4)，精准定位绝对进度秒数: {start_pos}")
         else:
-            target_video = os.path.join(self.mesen_dir, "bszelda", "video", f"{video_name}.mp4")
+            target_video = os.path.join(self.base_dir, "bszelda", "video", f"{video_name}.mp4")
             start_pos = 0
             self.is_waiting_video_mode = False
 
@@ -1114,38 +1207,27 @@ class BSXSimulator:
         cw, ch, cx, cy = 256, 224, 0, 0
         if m:
             try:
-                hwnd = getattr(m, '_hWnd', None)
-                if hwnd:
-                    self.dpi_scale = self._get_system_dpi_scale(hwnd)
+                self.dpi_scale = self.platform.get_dpi_scale(m)
 
-                    # 声明 Windows 核心位置状态结构体
-                    wp = self._WINDOWPLACEMENT()
-                    wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
+                is_minimized = self.platform.is_minimized(m)
 
-                    is_minimized = False
-                    if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-                        # showCmd == 2 代表处于最小化状态
-                        if wp.showCmd == 2:
-                            is_minimized = True
+                # 状态平滑流转逻辑
+                if is_minimized:
+                    if not self._overlay_minimized_by_mesen:
+                        self._overlay_minimized_by_mesen = True
+                        if self.overlay and self.overlay.winfo_exists():
+                            self.overlay.withdraw()
+                            logging.info("[同步状态] 检测到模拟器已最小化，平滑隐藏遮罩窗口。")
+                else:
+                    if self._overlay_minimized_by_mesen:
+                        self._overlay_minimized_by_mesen = False
+                        if self.overlay and self.overlay.winfo_exists():
+                            self.overlay.deiconify()
+                            logging.info("[同步状态] 检测到模拟器已恢复正常，重新唤醒遮罩覆盖。")
 
-                    # 状态平滑流转逻辑
-                    if is_minimized:
-                        if not self._overlay_minimized_by_mesen:
-                            self._overlay_minimized_by_mesen = True
-                            if self.overlay and self.overlay.winfo_exists():
-                                self.overlay.withdraw()  # 视觉隐藏，防穿帮
-                                logging.info("[同步状态] 检测到模拟器已最小化，平滑隐藏遮罩窗口。")
-                    else:
-                        if self._overlay_minimized_by_mesen:
-                            self._overlay_minimized_by_mesen = False
-                            if self.overlay and self.overlay.winfo_exists():
-                                self.overlay.deiconify()  # 恢复可见
-                                logging.info("[同步状态] 检测到模拟器已恢复正常，重新唤醒遮罩覆盖。")
-
-                    # 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算
-                    # 这样在视频初始化、切换视频瞬间，即使最小化，MPV 也能拿到安全有效的非零几何数据
-                    is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
-                    cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
+                # 无论是否最小化，都必须强制完成真实的像素坐标和高宽计算
+                is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                cw, ch, cx, cy = self._get_client_geometry(m, is_fullscreen_optimize)
 
                 # 如果计算出的数据由于最小化产生异常（比如变成了0），强行用内置默认比例兜底
                 if cw <= 0 or ch <= 0:
@@ -1187,8 +1269,8 @@ class BSXSimulator:
         self._set_mesen_mute(False)
 
         if self.is_ending_mode and self.mesen_dir and self.selected_mode:
-            sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-            reset_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, "0")
+            sat_dir = self.platform.get_satellaview_dir()
+            reset_dir = os.path.join(self.base_dir, "bszelda", self.selected_mode, "0")
             if os.path.exists(reset_dir):
                 os.makedirs(sat_dir, exist_ok=True)
                 for item in os.listdir(reset_dir):
@@ -1228,8 +1310,8 @@ class BSXSimulator:
         logging.info("[线程监控] 模拟卫星时钟主循环子线程已停止。")
 
     def trigger_broadcast_and_audio(self):
-        sat_dir = os.path.join(self.mesen_dir, "Satellaview")
-        ch_dir = os.path.join(self.mesen_dir, "bszelda", self.selected_mode, str(self.selected_chapter))
+        sat_dir = self.platform.get_satellaview_dir()
+        ch_dir = os.path.join(self.base_dir, "bszelda", self.selected_mode, str(self.selected_chapter))
         if os.path.exists(ch_dir):
             os.makedirs(sat_dir, exist_ok=True)
             for item in os.listdir(ch_dir):
@@ -1239,7 +1321,7 @@ class BSXSimulator:
                     continue
 
         # 音频文件路径不变（共用）
-        audio_path = os.path.join(self.mesen_dir, "bszelda", "wav", f"{self.selected_chapter}.wav")
+        audio_path = os.path.join(self.base_dir, "bszelda", "wav", f"{self.selected_chapter}.wav")
         self._play_audio(audio_path, volume=1.0)
 
     def _settlement_sync_loop(self):
@@ -1256,54 +1338,41 @@ class BSXSimulator:
             m = self._get_mesen_window()
             if m:
                 try:
-                    hwnd = getattr(m, '_hWnd', None)
-                    if hwnd:
-                        self.dpi_scale = self._get_system_dpi_scale(hwnd)
+                    self.dpi_scale = self.platform.get_dpi_scale(m)
+                    is_minimized = self.platform.is_minimized(m)
 
-                        # 获取 Windows 窗口当前的真实显示放置状态
-                        wp = self._WINDOWPLACEMENT()
-                        wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
+                    # 如果玩家在结算界面又最小化了模拟器
+                    if is_minimized:
+                        if not self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = True
+                            self.overlay.withdraw()
+                            logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
 
-                        is_minimized = False
-                        if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-                            if wp.showCmd == 2:  # 2 = SW_SHOWMINIMIZED（最小化状态）
-                                is_minimized = True
+                        self.root.after(30, self._settlement_sync_loop)
+                        return
 
-                        # 如果玩家在结算界面又最小化了模拟器
-                        if is_minimized:
-                            if not self._overlay_minimized_by_mesen:
-                                self._overlay_minimized_by_mesen = True
-                                self.overlay.withdraw()  # 随动隐形，保证桌面不穿帮
-                                logging.info("[结算守护] 玩家在结算单界面最小化了模拟器，已安全隐形。")
+                    # 如果玩家又把模拟器从任务栏里点开了（恢复正常）
+                    else:
+                        if self._overlay_minimized_by_mesen:
+                            self._overlay_minimized_by_mesen = False
+                            self.overlay.deiconify()
+                            logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
 
-                            # 核心拦截！不要去执行后续错误的 0x0 图形刷新，静默等待复原
-                            self.root.after(30, self._settlement_sync_loop)
-                            return
-
-                        # 如果玩家又把模拟器从任务栏里点开了（恢复正常）
-                        else:
-                            if self._overlay_minimized_by_mesen:
-                                self._overlay_minimized_by_mesen = False
-                                self.overlay.deiconify()  # 随动恢复可见
-                                logging.info("[结算守护] 玩家恢复了模拟器，重新唤醒成绩单渲染。")
-
-                                # 刚复活瞬间强制洗牌，重新填满画面
-                                is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
-                                cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
-                                if cw > 0 and ch > 0:
-                                    self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
-                                    self._render_settlement_content(cw, ch)
-
-                        # 处于未最小化的普通游玩/拉伸状态，执行你原汁原味的几何同步
-                        is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
-                        cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
-                        if cw > 0 and ch > 0:
-                            geo_str = f"{cw}x{ch}+{cx}+{cy}"
-                            if self._last_geo != geo_str:
-                                self._last_geo = geo_str
-                                self.overlay.geometry(geo_str)
-                                # 如果玩家拉伸或拖动了窗口，完美触发你的 Canvas 刷新逻辑
+                            is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                            cw, ch, cx, cy = self._get_client_geometry(m, is_fullscreen_optimize)
+                            if cw > 0 and ch > 0:
+                                self.overlay.geometry(f"{cw}x{ch}+{cx}+{cy}")
                                 self._render_settlement_content(cw, ch)
+
+                    # 处于未最小化的普通游玩/拉伸状态
+                    is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
+                    cw, ch, cx, cy = self._get_client_geometry(m, is_fullscreen_optimize)
+                    if cw > 0 and ch > 0:
+                        geo_str = f"{cw}x{ch}+{cx}+{cy}"
+                        if self._last_geo != geo_str:
+                            self._last_geo = geo_str
+                            self.overlay.geometry(geo_str)
+                            self._render_settlement_content(cw, ch)
                 except (TclError, Exception) as loop_err:
                     logging.debug(f"[结算同步环异常] {loop_err}")
             else:
@@ -1359,34 +1428,18 @@ class BSXSimulator:
             self.close_overlay()
             return
 
-        hwnd = getattr(m, '_hWnd', None)
-        if hwnd:
-            self.dpi_scale = self._get_system_dpi_scale(hwnd)
-            # 在这里拦截并强行恢复最小化的模拟器
+        if m:
+            self.dpi_scale = self.platform.get_dpi_scale(m)
             try:
-                # 向 Windows 查询当前模拟器的放置状态
-                wp = self._WINDOWPLACEMENT()
-                wp.length = ctypes.sizeof(self._WINDOWPLACEMENT)
-
-                if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
-                    # showCmd == 2 代表当前确实处于最小化状态
-                    if wp.showCmd == 2:
-                        # 9 = SW_RESTORE (从任务栏恢复)
-                        ctypes.windll.user32.ShowWindow(hwnd, 9)
-                        # 5 = SW_SHOW (显式展示窗口)
-                        ctypes.windll.user32.ShowWindow(hwnd, 5)
-                        # 将模拟器强行拉到屏幕最前台
-                        ctypes.windll.user32.SetForegroundWindow(hwnd)
-                        logging.info("[结算唤醒] 检测到模拟器处于最小化，已成功恢复并强抬至前台。")
-
-                        # 强抬可能需要微小的系统级刷新时间，让 Win32 响应后再读取最新位置
-                        time.sleep(0.05)
+                if self.platform.is_minimized(m):
+                    self.platform.restore_window(m)
+                    logging.info("[结算唤醒] 检测到模拟器处于最小化，已成功恢复并强抬至前台。")
+                    time.sleep(0.05)
             except Exception as e:
                 logging.debug(f"[结算唤醒异常] {e}")
 
-            # 此时模拟器已经物理复位，计算出来的绝对是最精准的正常高宽！
             is_fullscreen_optimize = (self.fullscreen_optimize_var.get() == "true")
-            cw, ch, cx, cy = self._get_client_geometry(hwnd, is_fullscreen_optimize)
+            cw, ch, cx, cy = self._get_client_geometry(m, is_fullscreen_optimize)
 
         self._last_geo = f"{cw}x{ch}+{cx}+{cy}"
         self.overlay.geometry(self._last_geo)
@@ -1447,7 +1500,7 @@ class BSXSimulator:
                 if match:
                     final_ch = match.group(1)
 
-            bg_path = os.path.join("ui", "bg_result.png")
+            bg_path = get_resource_path("ui", "bg_result.png")
             if os.path.exists(bg_path):
                 bg_img = Image.open(bg_path).resize((render_w, render_h), Image.Resampling.LANCZOS)
                 self.bg_image_ref = ImageTk.PhotoImage(bg_img)
@@ -1463,9 +1516,9 @@ class BSXSimulator:
             logical_h = render_h
 
             self.canvas.create_text(center_x, offset_y + logical_h * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(_FONT_FAMILY, f_size))
             self.canvas.create_text(center_x, offset_y + logical_h * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(_FONT_FAMILY, f_size))
 
             label_x = offset_x + logical_w * 0.15
             value_x = offset_x + logical_w * 0.42
@@ -1473,15 +1526,15 @@ class BSXSimulator:
             spacing = logical_h * 0.09
 
             self.canvas.create_text(label_x, curr_y, text=self.ganon_var.get(), fill="#FFFFFF",
-                                    font=("Segoe UI", f_size), anchor="w")
+                                    font=(_FONT_FAMILY, f_size), anchor="w")
             curr_y += spacing
-            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=("Segoe UI", f_size),
+            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=(_FONT_FAMILY, f_size),
                                     anchor="w")
 
             # 三角力量图标
             self.triforce_frames = self._load_gif_frames(
-                os.path.join("ui", "triforce_on.gif"), (int(render_w * 0.055), int(render_w * 0.055)))
-            off_path = os.path.join("ui", "triforce_off.png")
+                get_resource_path("ui", "triforce_on.gif"), (int(render_w * 0.055), int(render_w * 0.055)))
+            off_path = get_resource_path("ui", "triforce_off.png")
 
             tf_bits = [int(b) for b in bin(tf_val)[2:].zfill(8)]
             for i, bit in enumerate(tf_bits):
@@ -1501,17 +1554,17 @@ class BSXSimulator:
                     self.rupee_var.get().split(":")[-1].strip()]
             for i in range(3):
                 curr_y += spacing
-                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=("Segoe UI", f_size),
+                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=(_FONT_FAMILY, f_size),
                                         anchor="w")
                 self.canvas.create_text(offset_x + logical_w * 0.85, curr_y, text=vals[i], fill="#FFFFFF",
-                                        font=("Segoe UI", f_size), anchor="e")
+                                        font=(_FONT_FAMILY, f_size), anchor="e")
 
             self.canvas.create_rectangle(offset_x + logical_w * 0.1, offset_y + logical_h * 0.85,
                                          offset_x + logical_w * 0.9, offset_y + logical_h * 0.93,
                                          outline="#F1C40F", width=2)
 
             self.canvas.create_text(center_x, offset_y + logical_h * 0.89, text="按下任意键继续", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(_FONT_FAMILY, f_size))
 
             logging.info("[结算渲染] 结算界面比例适配渲染完毕。")
 
@@ -1539,7 +1592,7 @@ class BSXSimulator:
                 self.overlay.update()
                 self.overlay.deiconify()
                 self.overlay.focus_force()
-                ctypes.windll.user32.SetForegroundWindow(self.overlay.winfo_id())
+                self.platform.bring_tk_to_front(self.overlay)
         except (TclError, OSError):
             pass
 
@@ -1547,50 +1600,13 @@ class BSXSimulator:
         self._poll_global_input(_trigger_next_page)
 
     def _poll_global_input(self, trigger_callback):
-        """ 全外设盲听：GetAsyncKeyState(键盘) + XInput底层(手柄) """
         if hasattr(self, '_stop_global_check') and self._stop_global_check:
             return
 
         try:
-            triggered = False
-
-            # 1. 跨进程全局键盘盲听（键盘）
-            for vk_code in range(8, 256):
-                if vk_code in (1, 2):  # 过滤鼠标左右键点击
-                    continue
-                if ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000:
-                    logging.info(f"[全局硬件触发] 检测到键盘按键 VK_{vk_code} 按下")
-                    triggered = True
-                    break
-
-            # 2. XInput 全局手柄检测（手柄）
+            triggered = self.platform.poll_keyboard()
             if not triggered:
-                # 声明 XInput 手柄状态结构体类型
-                class XinputButtons(ctypes.Structure):
-                    _fields_ = [("wButtons", ctypes.c_ushort)]
-
-                class XinputState(ctypes.Structure):
-                    _fields_ = [("dwPacketNumber", ctypes.c_ulong), ("Gamepad", XinputButtons)]
-
-                state = XinputState()
-
-                # 盲听 0 到 3 号位（支持多达 4 个手柄接入）
-                for user_index in range(4):
-                    # 尝试调用 Windows 系统的 XInput1_4 或 9_1_0 驱动读取状态
-                    # 0 代表 ERROR_SUCCESS（成功读取到该序号的手柄输入）
-                    res = ctypes.windll.xinput1_4.XInputGetState(user_index, ctypes.byref(state))
-                    if res != 0:
-                        # 如果系统找不到 XInput1_4 (比如老系统)，自动退回旧版通用驱动尝试
-                        res = ctypes.windll.xinput9_1_0.XInputGetState(user_index, ctypes.byref(state))
-
-                    if res == 0:
-                        # 读取当前时刻手柄按下的二进制按键掩码
-                        buttons_mask = state.Gamepad.wButtons
-                        # 只要掩码大于 0，说明玩家正在按手柄上的任意键（A/B/X/Y/方向键/肩键/菜单键等）
-                        if buttons_mask > 0:
-                            logging.info(f"[全局硬件触发] 检测到 {user_index} 号手柄按键掩码 {buttons_mask} 处于激活态")
-                            triggered = True
-                            break
+                triggered = self.platform.poll_gamepad()
 
             if triggered:
                 trigger_callback()
@@ -1599,7 +1615,6 @@ class BSXSimulator:
         except Exception as e:
             logging.debug(f"[内核级全局轮询异常] {e}")
 
-        # 每 25 毫秒抽样一次（40 FPS，兼顾零延迟与超低 CPU 占用）
         if self.overlay and self.overlay.winfo_exists():
             self.overlay.after(25, lambda: self._poll_global_input(trigger_callback))
 
@@ -1637,7 +1652,7 @@ class BSXSimulator:
             match = re.search(r'(\d+)', rom_chapter)
             if match:
                 final_ch = match.group(1)
-        video_p = os.path.join(self.mesen_dir, "bszelda", "video", f"ED{final_ch}.mp4")
+        video_p = _resolve_file_case(os.path.join(self.base_dir, "bszelda", "video", f"ED{final_ch}.mp4"))
         if os.path.exists(video_p):
             try:
                 self.canvas.delete("all")
