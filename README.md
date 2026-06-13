@@ -116,4 +116,8 @@
 
 本项目采用 **MIT License** 开源。你可以自由地使用、修改和分发代码，但请务必保留原作者信息。
 
+本项目使用的思源黑体（Source Han Sans）由 Adobe 与 Google 共同开发，采用 [SIL Open Font License 1.1](https://openfontlicense.org) 授权。
+
+Copyright © 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+
 > **注**：本工具仅供技术交流与怀旧体验，项目本身**不包含**游戏 ROM、视频或音频等受版权保护的内容。配套的多媒体资源包完全独立于本项目之外分发，其内部使用的第三方非商用资产引用明细，请参阅资源包内的 `README.txt`。
