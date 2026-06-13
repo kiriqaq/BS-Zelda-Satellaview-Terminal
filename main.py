@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import ctypes
+import sys
 
 try:
     # 优先尝试启用 Windows 10 推荐的 Per-Monitor (V2) DPI 感知
@@ -28,6 +29,7 @@ from ctypes import windll, wintypes
 from datetime import datetime, timedelta
 from tkinter import (Tk, Label, filedialog, StringVar, Checkbutton, Button, Frame, Toplevel, Canvas, messagebox,
                      TclError)
+import atexit
 
 import pygame
 import pygetwindow as gw
@@ -107,10 +109,13 @@ class BSXSimulator:
         # 初始化系统环境
         self.dpi_scale = self._get_system_dpi_scale()
         self.show_debug_ui = False
-
         self.root = Tk()
-        self.root.title("Satellaview Terminal 1.3.1")
+        self.root.title("Satellaview Terminal 1.3.2")
 
+        # 注册自定义字体
+        self.custom_font_name = self._register_custom_font()
+
+        # 界面分辨率
         window_w = int(340 * self.dpi_scale)
         window_h = int((950 if self.show_debug_ui else 520) * self.dpi_scale)
         self.root.geometry(f"{window_w}x{window_h}")
@@ -160,6 +165,7 @@ class BSXSimulator:
         self.rupee_var = StringVar(value="所持的卢比数量: -- 卢比")
         self.triforce_var = StringVar(value="三角力量收集情况:\n△ △ △ △ △ △ △ △")
         self.ganon_var = StringVar(value="？？？？？")
+
         # 初始化画面比例控制变量，默认开启(true)
         self.keep_aspect_ratio_var = StringVar(value="true")
         self.ntsc_ratio_var = StringVar(value="false")  # 8:7 比例
@@ -197,6 +203,40 @@ class BSXSimulator:
         except Exception as e:
             logging.warning(f"[DPI获取] 传统方法也失败: {e}，默认返回 1.0")
             return 1.0
+
+    def _register_custom_font(self):
+        """注册自定义字体，返回字体族名；失败时回退到 'Segoe UI'"""
+        # 判断是否打包成 exe
+        if getattr(sys, 'frozen', False):
+            # 使用 getattr 并提供回退值
+            base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+
+        font_path = os.path.join(base_path, "fonts", "SourceHanSansHC-Normal.otf")
+
+        if not os.path.exists(font_path):
+            logging.warning(f"[字体] 未找到自定义字体文件: {font_path}，将使用默认字体 Segoe UI")
+            return "Segoe UI"
+        try:
+            fr_private = 0x10
+            ctypes.windll.gdi32.AddFontResourceExW(font_path, fr_private, 0)
+            atexit.register(lambda: self._unregister_custom_font(font_path))
+            logging.info(f"[字体] 成功注册自定义字体: {font_path}")
+            return "思源黑體 香港 Normal"
+        except Exception as e:
+            logging.error(f"[字体] 注册失败: {e}，将使用默认字体 Segoe UI")
+            return "Segoe UI"
+
+    @staticmethod
+    def _unregister_custom_font(font_path):
+        """卸载自定义字体"""
+        try:
+            fr_private = 0x10
+            ctypes.windll.gdi32.RemoveFontResourceExW(font_path, fr_private, 0)
+            logging.info(f"[字体] 已卸载: {font_path}")
+        except Exception as e:
+            logging.warning(f"[字体] 卸载失败: {e}")
 
     @staticmethod
     def _load_gif_frames(path, size):
@@ -360,9 +400,9 @@ class BSXSimulator:
 
     def _setup_ui(self):
         # 字号转为绝对物理像素，与窗口框架 1:1 纯线性对齐
-        dynamic_ui_font = ("Segoe UI", -int(26 * self.dpi_scale), "bold")
-        dynamic_monitor_font = ("Segoe UI", -int(14 * self.dpi_scale), "bold")
-        dynamic_tf_font = ("Segoe UI", -int(16 * self.dpi_scale), "bold")
+        dynamic_ui_font = (self.custom_font_name, -int(26 * self.dpi_scale), "bold")
+        dynamic_monitor_font = (self.custom_font_name, -int(14 * self.dpi_scale), "bold")
+        dynamic_tf_font = (self.custom_font_name, -int(16 * self.dpi_scale), "bold")
 
         # 界面间距随 DPI 实时调整物理高度
         pad_5 = int(5 * self.dpi_scale)
@@ -1407,6 +1447,11 @@ class BSXSimulator:
             self._clear_animation_timers()
             self.canvas.delete("all")
 
+            if getattr(sys, 'frozen', False):
+                base = getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+            else:
+                base = os.path.dirname(__file__)
+
             # 计算实际渲染区域（考虑保持比例）
             # 只要勾选了 4:3 或 8:7 任一，就启用比例保持
             is_keep_aspect = (self.keep_aspect_ratio_var.get() == "true" or self.ntsc_ratio_var.get() == "true")
@@ -1447,7 +1492,7 @@ class BSXSimulator:
                 if match:
                     final_ch = match.group(1)
 
-            bg_path = os.path.join("ui", "bg_result.png")
+            bg_path = os.path.join(base, "ui", "bg_result.png")
             if os.path.exists(bg_path):
                 bg_img = Image.open(bg_path).resize((render_w, render_h), Image.Resampling.LANCZOS)
                 self.bg_image_ref = ImageTk.PhotoImage(bg_img)
@@ -1463,9 +1508,9 @@ class BSXSimulator:
             logical_h = render_h
 
             self.canvas.create_text(center_x, offset_y + logical_h * 0.12, text="BS 塞尔达传说成绩", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(self.custom_font_name, f_size))
             self.canvas.create_text(center_x, offset_y + logical_h * 0.20, text=f"— 第 {final_ch} 周 —", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(self.custom_font_name, f_size))
 
             label_x = offset_x + logical_w * 0.15
             value_x = offset_x + logical_w * 0.42
@@ -1473,15 +1518,15 @@ class BSXSimulator:
             spacing = logical_h * 0.09
 
             self.canvas.create_text(label_x, curr_y, text=self.ganon_var.get(), fill="#FFFFFF",
-                                    font=("Segoe UI", f_size), anchor="w")
+                                    font=(self.custom_font_name, f_size), anchor="w")
             curr_y += spacing
-            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=("Segoe UI", f_size),
+            self.canvas.create_text(label_x, curr_y, text="三角力量", fill="#FFFFFF", font=(self.custom_font_name, f_size),
                                     anchor="w")
 
             # 三角力量图标
             self.triforce_frames = self._load_gif_frames(
-                os.path.join("ui", "triforce_on.gif"), (int(render_w * 0.055), int(render_w * 0.055)))
-            off_path = os.path.join("ui", "triforce_off.png")
+                os.path.join(base, "ui", "triforce_on.gif"), (int(render_w * 0.055), int(render_w * 0.055)))
+            off_path = os.path.join(base, "ui", "triforce_off.png")
 
             tf_bits = [int(b) for b in bin(tf_val)[2:].zfill(8)]
             for i, bit in enumerate(tf_bits):
@@ -1501,17 +1546,18 @@ class BSXSimulator:
                     self.rupee_var.get().split(":")[-1].strip()]
             for i in range(3):
                 curr_y += spacing
-                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=("Segoe UI", f_size),
+                self.canvas.create_text(label_x, curr_y, text=labels[i], fill="#FFFFFF", font=(self.custom_font_name,
+                                                                                               f_size),
                                         anchor="w")
                 self.canvas.create_text(offset_x + logical_w * 0.85, curr_y, text=vals[i], fill="#FFFFFF",
-                                        font=("Segoe UI", f_size), anchor="e")
+                                        font=(self.custom_font_name, f_size), anchor="e")
 
             self.canvas.create_rectangle(offset_x + logical_w * 0.1, offset_y + logical_h * 0.85,
                                          offset_x + logical_w * 0.9, offset_y + logical_h * 0.93,
                                          outline="#F1C40F", width=2)
 
             self.canvas.create_text(center_x, offset_y + logical_h * 0.89, text="按下任意键继续", fill="#FFFFFF",
-                                    font=("Segoe UI", f_size))
+                                    font=(self.custom_font_name, f_size))
 
             logging.info("[结算渲染] 结算界面比例适配渲染完毕。")
 
