@@ -14,10 +14,11 @@
 
 ## 💻 运行要求与环境部署
 
-* **操作系统**：Windows 10 / 11 测试通过。
+* **操作系统**：Windows 10 / 11 / macOS 12+ (Apple Silicon / Intel) 测试通过。
 * **必要软件环境**：
-    * Python 3.9.13 或更高版本 (用于运行或编译主程序)。
-    * [Mesen 模拟器](https://www.mesen.ca/) 。
+    * Python 3.9 或更高版本 (用于运行或编译主程序)。
+    * [MesenCE 模拟器](https://github.com/NovaSquirrel/MesenCE) (推荐 Community Edition，支持多平台)。
+    * macOS 额外依赖：`brew install mpv sdl2 python-tk`
 * **汉化资源包或懒人整合包**：
     * 已统一放置在演示视频的简介与置顶评论区，请移步获取：
     *  [📺 点击前往 AcFun 视频发布页获取资源包](https://www.acfun.cn/v/ac48565019)
@@ -34,15 +35,20 @@
 ### ⚙️ 配置与启动
 
 1. **配置模拟器**：
-   * 下载 Mesen 2.1.1。
+   * 下载 MesenCE。
    * 双击打开并进行安装配置，必须选择 Store the data in same folder as the application，**请勿使用任何带有中文的文件夹。**
    * 关闭模拟器。
-   * 下载配套使用的汉化资源包。将 `bszelda` 文件夹放置在 Mesen 模拟器的根目录中。
+   * 下载配套使用的汉化资源包。将 `bszelda` 文件夹放置在你偏好的目录中。
+   * macOS 用户：选择 `Mesen.app` 目录即可，资源目录可独立放置。
 
 2. **启动程序**：
-   * 运行 `main.py` 或 `Satellaview-Terminal.exe` （无需启动 Mesen 模拟器）。
-   * 在界面中点击按钮选择你的 `Mesen.exe` 主程序。
-   * 首次运行会要求选择 `BS-X BIOS` 文件，选择自己下载的文件即可。
+   * 运行 `main.py` （无需启动 Mesen 模拟器）。
+   * 或在 tools/ 目录执行编译脚本生成可执行文件。
+   * 在界面中点击按钮选择你的 Mesen 主程序（Windows: `Mesen.exe`，macOS: `Mesen.app`）。
+   * 程序会自动检测 `bszelda` 资源目录，也可通过「自定义资源目录」按钮手动指定。
+   * macOS 特别步骤：
+     * 启动 MesenCE 后，进入 `Script → Settings → Script Window → Restrictions`，勾选 `Allow access to I/O and OS functions`（需手动设置，无法通过配置文件自动开启）。
+     * 进入 `BS-X → Use custom date and time`，设置为 `09:59` 并点击 ✓ 确认。
    * 选择推送 `表模式` / `里模式（Map2）` 的广播数据。
    * 继续选择要进行的周任务后，点击启动。模拟器会自动打开并加载对应数据。
    * 在卫星时钟到达 18：00 之后会自动推送广播数据，此时去左侧的活动中心下载游玩即可。
@@ -74,8 +80,10 @@
 
 * **`main.py`**：基于 Tkinter 和 OpenCV 构建的主逻辑程序，负责 UI 和视频渲染。
 * **`bs.lua`**：负责内存读取与信号下发的 Lua 核心脚本，需在模拟器内运行。
+* **`platform/`**：平台抽象层，自动适配 Windows / macOS 差异。
 * **`ui/`**：存放结算界面背景 `bg_result.png` 和三角力量动画 `triforce_on.gif`。
-* **`requirements.txt`**：记录项目所需的 `pygame`, `opencv-python`, `pygetwindow` 等核心依赖。
+* **`tools/`**：编译打包脚本 (`build_macos.sh` / `build_windows.bat`)。
+* **`requirements.txt`**：记录项目核心依赖。
 
 ---
 
@@ -107,6 +115,13 @@
     
 * **UI部分显示不全或错乱**
   * 建议将 Windows 缩放比例调整为 150% 或更低即可正常使用。
+
+* **macOS 上 Lua 脚本无法写入文件**
+  * 启动 MesenCE 后，进入 `Script → Settings → Script Window → Restrictions`，手动勾选 `Allow access to I/O and OS functions`。
+  * 该选项在 macOS NativeAOT 构建中无法通过配置文件自动开启，必须手动设置一次。
+
+* **macOS 上选择 Mesen.app 后程序无响应**
+  * 确保在文件对话框中将过滤器设为「All files」，macOS 的文件对话框不支持按 `.app` 扩展名过滤。
 
 ---
 

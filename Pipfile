@@ -1,0 +1,23 @@
+[[source]]
+url = "http://mirrors.aliyun.com/pypi/simple/"
+verify_ssl = false
+name = "aliyun"
+
+[packages]
+pygame = ">=2.0.0"
+pillow = ">=9.0.0"
+python-mpv = ">=1.0.0"
+
+[windows]
+pygetwindow = ">=0.0.9"
+pycaw = ">=20240210"
+
+[macos]
+pyobjc-framework-quartz = ">=10.0"
+pyobjc-framework-cocoa = ">=10.0"
+
+[requires]
+python_version = "3.14"
+
+[dev-packages]
+pyinstaller = ">=6.0"
